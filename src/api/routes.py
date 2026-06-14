@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from urllib.parse import urlparse
@@ -22,6 +23,21 @@ def _normalise_domain(domain: str) -> str:
         domain = f"https://{domain}"
     parsed = urlparse(domain)
     return f"{parsed.scheme}://{parsed.netloc}/"
+
+
+def _parse_ai_recommendations(ai_insights) -> dict:
+    """Safely converts stringified or raw database text into a clean Python dictionary structure."""
+    if not ai_insights:
+        return {}
+    if isinstance(ai_insights, str):
+        try:
+            return json.loads(ai_insights)
+        except Exception as e:
+            logger.warning("Failed to parse stringified ai_insights: %s", e)
+            return {"overall_score": 0, "summary": ai_insights, "critical_issues": [], "quick_wins": []}
+    if isinstance(ai_insights, dict):
+        return ai_insights
+    return {}
 
 
 async def _run_pagespeed(url: str) -> dict | None:
@@ -73,6 +89,10 @@ async def create_audit(domain: str):
     existing = await get_audit_by_domain(clean_domain)
     if existing:
         logger.info("Returning cached audit for %s", clean_domain)
+        
+        # Parse potential string records into a verified dict format
+        parsed_ai_recs = _parse_ai_recommendations(existing.get("ai_insights"))
+        
         return AuditResult(
             id=existing["id"],
             domain=clean_domain,
@@ -80,7 +100,7 @@ async def create_audit(domain: str):
             pages_crawled=existing.get("metrics", {}).get("pages_crawled", 0),
             metrics=existing.get("metrics", {}),
             pagespeed=existing.get("pagespeed"),
-            ai_recommendations=existing.get("ai_insights") or {},
+            ai_recommendations=parsed_ai_recs,
             pdf_url=existing.get("pdf_url"),
         )
 
@@ -102,6 +122,9 @@ async def create_audit(domain: str):
     except Exception as exc:
         logger.warning("AI analysis failed: %s", exc)
         ai_recs = {"overall_score": 0, "summary": str(exc), "critical_issues": [], "quick_wins": []}
+
+    # Ensure memory reference is a clean dictionary format before storage
+    ai_recs = _parse_ai_recommendations(ai_recs)
 
     # 4. Save to Supabase
     saved = await save_audit({
@@ -138,6 +161,10 @@ async def get_audit_endpoint(audit_id: str):
     record = await get_audit(audit_id)
     if not record:
         raise HTTPException(status_code=404, detail="Audit not found")
+        
+    # Safeguard against string conversions on direct entry fetches
+    parsed_ai_recs = _parse_ai_recommendations(record.get("ai_insights"))
+    
     return AuditResult(
         id=record["id"],
         domain=record["domain"],
@@ -145,7 +172,7 @@ async def get_audit_endpoint(audit_id: str):
         pages_crawled=record.get("metrics", {}).get("pages_crawled", 0),
         metrics=record.get("metrics", {}),
         pagespeed=record.get("pagespeed"),
-        ai_recommendations=record.get("ai_insights") or {},
+        ai_recommendations=parsed_ai_recs,
         pdf_url=record.get("pdf_url"),
     )
 
