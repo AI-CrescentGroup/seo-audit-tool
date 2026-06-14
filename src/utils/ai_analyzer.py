@@ -62,7 +62,7 @@ def _parse_json_response(raw: str) -> dict:
     return {**_FALLBACK, "raw_response": raw}
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "anthropic/claude-sonnet-4-6"
+MODEL = "google/gemini-2.5-flash"
 
 SYSTEM_PROMPT = """You are a senior SEO consultant. Analyse the provided SEO audit metrics and return a JSON object with this exact structure:
 
