@@ -89,7 +89,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "http://localhost:8000",
+        "http://localhost:8080",
         "https://*.vercel.app",
     ],
     allow_origin_regex=r"https://.*\.vercel\.app",
