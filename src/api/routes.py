@@ -179,14 +179,32 @@ async def get_audit_endpoint(audit_id: str):
 
 @router.get("/audit/{audit_id}/pdf")
 async def get_pdf(audit_id: str):
-    """Redirect to the Supabase public PDF URL."""
+    """Return the PDF file directly with proper headers for browser download."""
     record = await get_audit(audit_id)
     if not record:
         raise HTTPException(status_code=404, detail="Audit not found")
+
     pdf_url = record.get("pdf_url")
     if not pdf_url:
         raise HTTPException(status_code=404, detail="PDF not yet generated for this audit")
-    return RedirectResponse(url=pdf_url)
+
+    # Fetch the PDF from Supabase Storage
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(pdf_url)
+            resp.raise_for_status()
+            pdf_bytes = resp.content
+    except Exception as exc:
+        logger.warning("Failed to fetch PDF from Supabase: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to retrieve PDF")
+
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=seo-audit-{audit_id}.pdf"}
+    )
 
 
 @router.get("/audits")

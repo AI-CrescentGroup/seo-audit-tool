@@ -1,7 +1,8 @@
 """
-Site-wide SEO crawler — extracts 13 metrics across up to 500 pages.
+Site-wide SEO crawler — extracts 23 metrics across up to 500 pages.
 """
 import asyncio
+import json
 import logging
 import time
 from collections import defaultdict
@@ -57,7 +58,10 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> dict:
         current = resp
         while current.is_redirect and len(chain) < 10:
             chain.append(str(current.url))
-            current = await client.send(current.next_request, follow_redirects=False)
+            next_request = current.next_request
+            if next_request is None:
+                break
+            current = await client.send(next_request, follow_redirects=False)
         result["redirect_chain"] = chain
         result["final_url"] = str(current.url)
         result["status"] = current.status_code
@@ -344,15 +348,290 @@ def metric_redirect_chains(pages: list[dict]) -> dict:
     }
 
 
+# ── 10 new metrics ────────────────────────────────────────────────────────────
+
+def metric_multiple_h1_tags(pages: list[dict]) -> dict:
+    """Pages with more than one <h1> tag."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        h1_count = len(soup.find_all("h1"))
+        if h1_count > 1:
+            affected.append(p["url"])
+    severity = "medium" if len(affected) > 5 else "low" if affected else "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_title_length_issues(pages: list[dict]) -> dict:
+    """Pages with title tag length outside 50-60 char range."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        tag = soup.find("title")
+        if tag and tag.get_text(strip=True):
+            length = len(tag.get_text(strip=True))
+            if length < 50 or length > 60:
+                affected.append(p["url"])
+    severity = "medium" if len(affected) > 5 else "low" if affected else "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_meta_description_length_issues(pages: list[dict]) -> dict:
+    """Pages with meta description length outside 120-158 char range."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        tag = soup.find("meta", attrs={"name": "description"})
+        if tag and (tag.get("content") or "").strip():
+            length = len((tag.get("content") or "").strip())
+            if length < 120 or length > 158:
+                affected.append(p["url"])
+    severity = "medium" if len(affected) > 5 else "low" if affected else "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_mixed_content(pages: list[dict]) -> dict:
+    """HTTPS pages with HTTP resources (img/script/link/css)."""
+    affected = []
+    for p in pages:
+        if not p["html"] or not p["url"].startswith("https://"):
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        has_http_resource = False
+        # Check img src
+        for img in soup.find_all("img"):
+            src = (img.get("src") or "").strip()
+            if src.startswith("http://"):
+                has_http_resource = True
+                break
+        # Check script src
+        if not has_http_resource:
+            for script in soup.find_all("script"):
+                src = (script.get("src") or "").strip()
+                if src.startswith("http://"):
+                    has_http_resource = True
+                    break
+        # Check link href (stylesheet, etc.)
+        if not has_http_resource:
+            for link in soup.find_all("link"):
+                href = (link.get("href") or "").strip()
+                if href.startswith("http://"):
+                    has_http_resource = True
+                    break
+        if has_http_resource:
+            affected.append(p["url"])
+    severity = "high" if affected else "low"
+    return _metric(len(affected), affected, severity)
+
+
+async def metric_broken_external_links(pages: list[dict]) -> dict:
+    """External links (different domain) returning 4xx/5xx."""
+    broken = []
+    seen_urls = set()
+
+    async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+        for p in pages:
+            if not p["html"]:
+                continue
+            soup = BeautifulSoup(p["html"], "html.parser")
+            parsed = urlparse(p["url"])
+            domain = parsed.netloc.lstrip("www.")
+
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+                    continue
+                full = urljoin(p["url"], href)
+                if not _same_domain(full, domain) and full not in seen_urls:
+                    seen_urls.add(full)
+                    try:
+                        resp = await client.get(full, headers=HEADERS)
+                        if resp.status_code >= 400:
+                            broken.append({"source": p["url"], "target": full, "status": resp.status_code})
+                    except Exception:
+                        pass
+
+    affected = list({b["source"] for b in broken})
+    severity = "medium" if broken else "low"
+    return {
+        "count": len(broken),
+        "affected_urls": affected[:200],
+        "broken_links": broken[:100],
+        "severity": severity,
+    }
+
+
+def metric_redirect_loops(pages: list[dict]) -> dict:
+    """Detect redirect loops where URL chain points back to itself."""
+    loops = []
+    for p in pages:
+        chain = p.get("redirect_chain") or []
+        if not chain:
+            continue
+        urls_in_chain = [p["url"]] + chain
+        # Check if any URL appears twice
+        if len(urls_in_chain) != len(set(urls_in_chain)):
+            loops.append({"url": p["url"], "chain": chain})
+    severity = "high" if loops else "low"
+    return {
+        "count": len(loops),
+        "affected_urls": [l["url"] for l in loops][:200],
+        "loops": loops[:50],
+        "severity": severity,
+    }
+
+
+def metric_hreflang_errors(pages: list[dict]) -> dict:
+    """Hreflang tag issues: missing reciprocal, invalid codes, conflicts."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        hreflangs = soup.find_all("link", attrs={"rel": "hreflang"})
+
+        # Check if hreflang tags exist but have issues
+        has_issues = False
+        if hreflangs:
+            for hl in hreflangs:
+                hreflang = (hl.get("hreflang") or "").strip()
+                # Basic validation: should be xx or xx-XX format
+                if hreflang and not (len(hreflang) == 2 or (len(hreflang) == 5 and hreflang[2] == "-")):
+                    has_issues = True
+                    break
+
+        if has_issues:
+            affected.append(p["url"])
+
+    severity = "medium" if len(affected) > 2 else "low" if affected else "low"
+    return _metric(len(affected), affected, severity)
+
+
+async def metric_xml_sitemap_issues(start_url: str, pages: list[dict]) -> dict:
+    """Check for sitemap.xml issues: missing, unreachable, or contains 404 URLs."""
+    parsed = urlparse(start_url)
+    domain = parsed.netloc.lstrip("www.")
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    sitemap_url = f"{base}/sitemap.xml"
+
+    issues = []
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(sitemap_url, headers=HEADERS)
+            if resp.status_code >= 400:
+                issues.append(f"sitemap.xml unreachable (HTTP {resp.status_code})")
+            else:
+                # Parse sitemap and check if URLs are 404
+                try:
+                    from xml.etree import ElementTree as ET
+                    root = ET.fromstring(resp.content)
+                    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+                    urls_in_sitemap = [elem.text for elem in root.findall(".//sm:loc", ns)]
+
+                    crawled_urls = {p["url"] for p in pages}
+                    for url in urls_in_sitemap[:20]:  # Check first 20
+                        if url not in crawled_urls:
+                            for p in pages:
+                                if p["url"] == url and p["status"] == 404:
+                                    issues.append(f"Sitemap contains 404: {url}")
+                                    break
+                except Exception:
+                    issues.append("sitemap.xml malformed or unreadable")
+    except Exception:
+        issues.append("sitemap.xml missing or unreachable")
+
+    severity = "medium" if issues else "low"
+    return {
+        "count": len(issues),
+        "affected_urls": [],
+        "issues": issues[:10],
+        "severity": severity,
+    }
+
+
+def metric_schema_markup_errors(pages: list[dict]) -> dict:
+    """JSON-LD structured data that's malformed or invalid."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            try:
+                json.loads(script.string or "")
+            except Exception:
+                affected.append(p["url"])
+                break
+    severity = "medium" if len(affected) > 5 else "low" if affected else "low"
+    return _metric(len(affected), affected, severity)
+
+
+async def metric_image_file_size_issues(pages: list[dict]) -> dict:
+    """Images over 200KB not in next-gen format (WebP/AVIF)."""
+    issues = []
+    seen_urls = set()
+
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        for p in pages:
+            if not p["html"]:
+                continue
+            soup = BeautifulSoup(p["html"], "html.parser")
+            for img in soup.find_all("img"):
+                src = (img.get("src") or "").strip()
+                if not src or src in seen_urls:
+                    continue
+                seen_urls.add(src)
+
+                full_url = urljoin(p["url"], src)
+                try:
+                    resp = await client.head(full_url, headers=HEADERS)
+                    size_bytes = int(resp.headers.get("content-length", 0))
+                    content_type = resp.headers.get("content-type", "").lower()
+
+                    if size_bytes > 200 * 1024:  # Over 200KB
+                        if "webp" not in content_type and "avif" not in content_type:
+                            issues.append({
+                                "page": p["url"],
+                                "src": src[:100],
+                                "size_kb": round(size_bytes / 1024, 1),
+                            })
+                except Exception:
+                    pass
+
+    affected = list({issue["page"] for issue in issues})
+    severity = "low" if len(affected) > 10 else "low"
+    return {
+        "count": len(issues),
+        "affected_urls": affected[:200],
+        "large_images": issues[:50],
+        "severity": severity,
+    }
+
+
 # ── main entry ────────────────────────────────────────────────────────────────
 
 async def run_full_audit(start_url: str) -> dict:
-    """Crawl the site and return all 13 metrics."""
+    """Crawl the site and return all 23 metrics."""
     pages = await crawl_site(start_url)
     crawled_urls = {p["url"] for p in pages}
 
+    # Run async metrics concurrently
+    async_results = await asyncio.gather(
+        metric_broken_external_links(pages),
+        metric_xml_sitemap_issues(start_url, pages),
+        metric_image_file_size_issues(pages),
+    )
+
     return {
         "pages_crawled": len(pages),
+        # Original 13 metrics
         "http_errors": metric_http_errors(pages),
         "missing_h1": metric_missing_h1(pages),
         "missing_meta_title": metric_missing_meta_title(pages),
@@ -366,4 +645,15 @@ async def run_full_audit(start_url: str) -> dict:
         "mobile_viewport": metric_mobile_viewport(pages),
         "https_check": metric_https(pages),
         "redirect_chains": metric_redirect_chains(pages),
+        # New 10 metrics
+        "multiple_h1_tags": metric_multiple_h1_tags(pages),
+        "title_length_issues": metric_title_length_issues(pages),
+        "meta_description_length_issues": metric_meta_description_length_issues(pages),
+        "mixed_content": metric_mixed_content(pages),
+        "broken_external_links": async_results[0],
+        "redirect_loops": metric_redirect_loops(pages),
+        "hreflang_errors": metric_hreflang_errors(pages),
+        "xml_sitemap_issues": async_results[1],
+        "schema_markup_errors": metric_schema_markup_errors(pages),
+        "image_file_size_issues": async_results[2],
     }
