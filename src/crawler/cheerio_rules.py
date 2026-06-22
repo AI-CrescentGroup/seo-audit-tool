@@ -35,6 +35,20 @@ def _same_domain(url: str, domain: str) -> bool:
     return host == domain or host == f"www.{domain}" or f"www.{host}" == domain
 
 
+_NON_HTML_EXTS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
+    ".pdf", ".zip", ".mp4", ".mp3", ".mov", ".avi", ".wmv",
+    ".woff", ".woff2", ".ttf", ".eot", ".css", ".js", ".xml",
+    ".json", ".csv", ".xls", ".xlsx", ".doc", ".docx",
+}
+
+
+def _is_html_url(url: str) -> bool:
+    path = urlparse(url).path.lower().rstrip("/")
+    ext = path.rsplit(".", 1)[-1] if "." in path.split("/")[-1] else ""
+    return f".{ext}" not in _NON_HTML_EXTS
+
+
 def _metric(count: int, affected_urls: list, severity: str) -> dict:
     return {"count": count, "affected_urls": affected_urls[:200], "severity": severity}
 
@@ -98,7 +112,7 @@ async def _fetch_sitemap_urls(start_url: str) -> set[str]:
                     # Extract <loc> tags from sitemap
                     for elem in root.findall(".//sm:loc", ns):
                         url = elem.text
-                        if url and _same_domain(url, domain):
+                        if url and _same_domain(url, domain) and _is_html_url(url):
                             urls.add(_norm(url))
 
                     logger.info(f"Sitemap: found {len(urls)} URLs from {sitemap_url}")
@@ -184,7 +198,7 @@ async def crawl_site(start_url: str) -> list[dict]:
                         if href.startswith(("mailto:", "tel:", "javascript:", "#")):
                             continue
                         full = _norm(urljoin(page["url"], href))
-                        if _same_domain(full, domain) and full not in queued:
+                        if _same_domain(full, domain) and full not in queued and _is_html_url(full):
                             queue.put_nowait(full)
                             queued.add(full)
 
