@@ -922,47 +922,53 @@ async def run_full_audit(start_url: str) -> dict:
         metric_image_file_size_issues(pages),
     )
 
+    # TEMPORARILY DISABLED FOR DEBUGGING
     # Calculate GEO scores for each page with error handling
-    logger.info(f"Starting GEO scoring for {len(pages)} pages")
+    # logger.info(f"Starting GEO scoring for {len(pages)} pages")
+    # geo_scores = []
+    # geo_failed_count = 0
+    #
+    # try:
+    #     geo_results = await asyncio.gather(
+    #         *[_calculate_geo_score_for_page(p, {}) for p in pages],
+    #         return_exceptions=True,  # Don't fail on individual page errors
+    #     )
+    #
+    #     for idx, result in enumerate(geo_results):
+    #         if isinstance(result, Exception):
+    #             page_url = pages[idx].get("url", f"page_{idx}") if idx < len(pages) else f"page_{idx}"
+    #             logger.error(f"GEO scoring crashed for {page_url}: {result}")
+    #             geo_failed_count += 1
+    #             # Create a fallback score for this page
+    #             geo_scores.append({
+    #                 "url": page_url,
+    #                 "geo_score": 0,
+    #                 "geo_signals": {},
+    #                 "geo_issues": [f"GEO scoring error: {str(result)[:100]}"],
+    #             })
+    #         else:
+    #             geo_scores.append(result)
+    # except Exception as e:
+    #     logger.exception(f"CRITICAL: GEO scoring batch processing failed: {e}")
+    #     geo_scores = []
+    #     geo_failed_count = len(pages)
+    #
+    # # Aggregate GEO scores
+    # avg_geo_score = 0
+    # try:
+    #     if geo_scores:
+    #         valid_scores = [g.get("geo_score", 0) for g in geo_scores if isinstance(g, dict)]
+    #         avg_geo_score = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0
+    # except Exception as e:
+    #     logger.error(f"GEO score aggregation failed: {e}")
+    #     avg_geo_score = 0
+    #
+    # logger.info(f"GEO scoring complete: {len(geo_scores) - geo_failed_count} pages scored, {geo_failed_count} failed")
+
+    # Stub values for disabled GEO scoring
     geo_scores = []
-    geo_failed_count = 0
-
-    try:
-        geo_results = await asyncio.gather(
-            *[_calculate_geo_score_for_page(p, {}) for p in pages],
-            return_exceptions=True,  # Don't fail on individual page errors
-        )
-
-        for idx, result in enumerate(geo_results):
-            if isinstance(result, Exception):
-                page_url = pages[idx].get("url", f"page_{idx}") if idx < len(pages) else f"page_{idx}"
-                logger.error(f"GEO scoring crashed for {page_url}: {result}")
-                geo_failed_count += 1
-                # Create a fallback score for this page
-                geo_scores.append({
-                    "url": page_url,
-                    "geo_score": 0,
-                    "geo_signals": {},
-                    "geo_issues": [f"GEO scoring error: {str(result)[:100]}"],
-                })
-            else:
-                geo_scores.append(result)
-    except Exception as e:
-        logger.exception(f"CRITICAL: GEO scoring batch processing failed: {e}")
-        geo_scores = []
-        geo_failed_count = len(pages)
-
-    # Aggregate GEO scores
     avg_geo_score = 0
-    try:
-        if geo_scores:
-            valid_scores = [g.get("geo_score", 0) for g in geo_scores if isinstance(g, dict)]
-            avg_geo_score = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0
-    except Exception as e:
-        logger.error(f"GEO score aggregation failed: {e}")
-        avg_geo_score = 0
-
-    logger.info(f"GEO scoring complete: {len(geo_scores) - geo_failed_count} pages scored, {geo_failed_count} failed")
+    logger.info("GEO scoring DISABLED for debugging")
 
     return {
         "pages_crawled": len(pages),
