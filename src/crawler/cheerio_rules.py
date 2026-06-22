@@ -75,29 +75,90 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> dict:
     return result
 
 
+# ── sitemap crawler ──────────────────────────────────────────────────────────
+
+async def _fetch_sitemap_urls(start_url: str) -> set[str]:
+    """Fetch all URLs from sitemap.xml."""
+    parsed = urlparse(start_url)
+    domain = parsed.netloc.lstrip("www.")
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    sitemap_url = f"{base}/sitemap.xml"
+
+    urls = set()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(sitemap_url, headers=HEADERS)
+            if resp.status_code == 200:
+                # Parse sitemap XML
+                try:
+                    from xml.etree import ElementTree as ET
+                    root = ET.fromstring(resp.content)
+                    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+                    # Extract <loc> tags from sitemap
+                    for elem in root.findall(".//sm:loc", ns):
+                        url = elem.text
+                        if url and _same_domain(url, domain):
+                            urls.add(_norm(url))
+
+                    logger.info(f"Sitemap: found {len(urls)} URLs from {sitemap_url}")
+                except Exception as e:
+                    logger.warning(f"Failed to parse sitemap: {e}")
+            else:
+                logger.debug(f"Sitemap not found at {sitemap_url} (status {resp.status_code})")
+    except Exception as e:
+        logger.debug(f"Sitemap fetch failed: {e}")
+
+    return urls
+
+
 # ── crawler ───────────────────────────────────────────────────────────────────
 
 async def crawl_site(start_url: str) -> list[dict]:
     """
     BFS crawl starting from start_url.
+    1. First loads URLs from sitemap.xml (catches JS-generated pages)
+    2. Then does BFS crawl to find remaining pages
     Returns list of page dicts (url, status, html, redirect_chain, load_ms, error).
     """
     parsed = urlparse(start_url)
     domain = parsed.netloc.lstrip("www.")
     visited: set[str] = set()
     queue: asyncio.Queue = asyncio.Queue()
-    queue.put_nowait(_norm(start_url))
+
+    # Load sitemap URLs first (this catches JS-generated pages that BFS misses)
+    logger.info(f"Attempting to load sitemap.xml for {start_url}")
+    sitemap_urls = await _fetch_sitemap_urls(start_url)
+    if sitemap_urls:
+        logger.info(f"Queuing {len(sitemap_urls)} URLs from sitemap")
+        for url in sitemap_urls:
+            queue.put_nowait(url)
+            visited.add(url)  # Mark as visited to avoid re-crawling
+    else:
+        logger.info("No sitemap.xml found, using BFS crawl only")
+
+    # Always queue the start URL (in case it wasn't in sitemap)
+    start_norm = _norm(start_url)
+    if start_norm not in visited:
+        queue.put_nowait(start_norm)
+
     results: list[dict] = []
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False) as client:
-        while not queue.empty() and len(visited) < MAX_PAGES:
+        pages_from_sitemap = 0
+        pages_from_bfs = 0
+
+        while not queue.empty() and len(results) < MAX_PAGES:
             batch = []
-            while not queue.empty() and len(batch) < CONCURRENCY:
-                url = await queue.get()
-                if url not in visited:
-                    visited.add(url)
-                    batch.append(url)
+            while not queue.empty() and len(batch) < CONCURRENCY and len(results) < MAX_PAGES:
+                try:
+                    url = queue.get_nowait()
+                    if url not in visited:
+                        visited.add(url)
+                        batch.append(url)
+                except asyncio.QueueEmpty:
+                    break
 
             if not batch:
                 break
@@ -110,6 +171,12 @@ async def crawl_site(start_url: str) -> list[dict]:
 
             for page in pages:
                 results.append(page)
+                # Track whether this came from sitemap or BFS discovery
+                if page["url"] in sitemap_urls:
+                    pages_from_sitemap += 1
+                else:
+                    pages_from_bfs += 1
+
                 if page["html"] and page["status"] == 200:
                     soup = BeautifulSoup(page["html"], "html.parser")
                     for a in soup.find_all("a", href=True):
@@ -120,7 +187,7 @@ async def crawl_site(start_url: str) -> list[dict]:
                         if _same_domain(full, domain) and full not in visited:
                             queue.put_nowait(full)
 
-    logger.info("Crawled %d pages for %s", len(results), domain)
+    logger.info(f"Crawled {len(results)} pages for {domain}: {pages_from_sitemap} from sitemap, {pages_from_bfs} from BFS discovery")
     return results
 
 
@@ -886,8 +953,13 @@ async def _calculate_geo_score_for_page(
 
 async def run_full_audit(start_url: str) -> dict:
     """Crawl the site and return all 23 metrics + GEO scores per page."""
+    logger.info(f"Starting audit for {start_url}")
+
     pages = await crawl_site(start_url)
+    logger.info(f"Crawl complete: {len(pages)} pages fetched")
+
     crawled_urls = {p["url"] for p in pages}
+    logger.info(f"Pages with HTML: {sum(1 for p in pages if p['html'])}")
 
     # Run async metrics concurrently
     async_results = await asyncio.gather(
@@ -896,35 +968,88 @@ async def run_full_audit(start_url: str) -> dict:
         metric_image_file_size_issues(pages),
     )
 
-    # Calculate GEO scores for each page with error handling
+    # Calculate GEO scores for each page with per-page timeout and error handling
     logger.info(f"Starting GEO scoring for {len(pages)} pages")
+    logger.info(f"Total pages crawled: {len(pages)}, pages to score: {len(pages)}")
+
     geo_scores = []
     scored_count = 0
     failed_count = 0
+    timeout_count = 0
+
+    async def score_page_with_timeout(page, timeout_sec=10):
+        """Score a single page with timeout."""
+        page_url = page.get("url", "unknown")
+        try:
+            result = await asyncio.wait_for(
+                _calculate_geo_score_for_page(page, {}),
+                timeout=timeout_sec
+            )
+            logger.debug(f"GEO scored page {page_url}: {result.get('geo_score', 0)}/10")
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(f"GEO timeout for {page_url} (>{timeout_sec}s)")
+            return {
+                "url": page_url,
+                "geo_score": 0,
+                "geo_signals": {},
+                "geo_issues": [f"GEO scoring timeout (>{timeout_sec}s)"],
+            }
+        except Exception as e:
+            logger.error(f"GEO exception for {page_url}: {e}")
+            return {
+                "url": page_url,
+                "geo_score": 0,
+                "geo_signals": {},
+                "geo_issues": [f"GEO error: {str(e)[:100]}"],
+            }
 
     try:
+        logger.info("Submitting all pages for GEO scoring (with 10s per-page timeout)...")
+
+        # Run with per-page timeouts instead of batch timeout
         geo_results = await asyncio.gather(
-            *[_calculate_geo_score_for_page(p, {}) for p in pages],
-            return_exceptions=True,  # Don't fail on individual page errors
+            *[score_page_with_timeout(p, timeout_sec=10) for p in pages],
+            return_exceptions=False,  # Handle exceptions inside score_page_with_timeout
         )
 
         for idx, result in enumerate(geo_results):
+            page_url = pages[idx].get("url", "unknown") if idx < len(pages) else f"page_{idx}"
+
             if isinstance(result, Exception):
-                page_url = pages[idx].get("url", f"page_{idx}") if idx < len(pages) else f"page_{idx}"
-                logger.error(f"GEO scoring exception for {page_url}: {result}")
+                logger.error(f"GEO result for {page_url} is exception: {result}")
                 failed_count += 1
-                # Create a fallback score for this page
                 geo_scores.append({
                     "url": page_url,
                     "geo_score": 0,
                     "geo_signals": {},
-                    "geo_issues": [f"GEO scoring error: {str(result)[:100]}"],
+                    "geo_issues": [f"Unexpected error: {str(result)[:100]}"],
                 })
-            else:
+            elif isinstance(result, dict) and "geo_score" in result:
                 geo_scores.append(result)
-                scored_count += 1
+                if result.get("geo_issues") and "timeout" in str(result.get("geo_issues")):
+                    timeout_count += 1
+                    logger.warning(f"Page {idx+1}/{len(pages)}: {page_url} TIMEOUT")
+                elif result.get("geo_issues") and "error" in str(result.get("geo_issues")).lower():
+                    failed_count += 1
+                    logger.warning(f"Page {idx+1}/{len(pages)}: {page_url} FAILED")
+                else:
+                    scored_count += 1
+                    logger.info(f"Page {idx+1}/{len(pages)}: {page_url} OK (score: {result.get('geo_score', 0)}/10)")
+            else:
+                logger.error(f"Unexpected result type for {page_url}: {type(result)}")
+                failed_count += 1
+                geo_scores.append({
+                    "url": page_url,
+                    "geo_score": 0,
+                    "geo_signals": {},
+                    "geo_issues": ["Unexpected result format"],
+                })
+
+        logger.info(f"GEO scoring batch complete")
     except Exception as e:
         logger.exception(f"CRITICAL: GEO scoring batch processing failed: {e}")
+        logger.error(f"Error details: {type(e).__name__}: {e}")
         geo_scores = []
         failed_count = len(pages)
 
@@ -934,11 +1059,12 @@ async def run_full_audit(start_url: str) -> dict:
         if geo_scores:
             valid_scores = [g.get("geo_score", 0) for g in geo_scores if isinstance(g, dict)]
             avg_geo_score = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0
+            logger.info(f"Average GEO score: {avg_geo_score}/10")
     except Exception as e:
         logger.error(f"GEO score aggregation failed: {e}")
         avg_geo_score = 0
 
-    logger.info(f"GEO scoring complete: {scored_count} pages scored, {failed_count} failed")
+    logger.info(f"GEO SCORING COMPLETE: {scored_count} OK, {failed_count} failed, {timeout_count} timeout out of {len(pages)} total")
 
     return {
         "pages_crawled": len(pages),
