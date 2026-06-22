@@ -51,6 +51,13 @@ async def get_audit_by_domain(domain: str) -> Optional[dict]:
         return None
 
 
+async def update_audit(audit_id: str, data: dict) -> None:
+    try:
+        get_client().table("audits").update(data).eq("id", audit_id).execute()
+    except Exception as exc:
+        logger.error("update_audit failed: %s", exc)
+
+
 async def update_pdf_url(audit_id: str, pdf_url: str) -> None:
     try:
         get_client().table("audits").update({"pdf_url": pdf_url}).eq("id", audit_id).execute()

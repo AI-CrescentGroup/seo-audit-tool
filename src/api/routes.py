@@ -3,12 +3,12 @@ import logging
 import os
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from src.crawler.cheerio_rules import run_full_audit
-from src.database.db import get_audit, get_audit_by_domain, list_audits, save_audit, update_pdf_url
+from src.database.db import get_audit, get_audit_by_domain, list_audits, save_audit, update_audit, update_pdf_url
 from src.utils.ai_analyzer import analyze_seo, rewrite_for_geo
 from src.utils.pdf_generator import generate_and_store_pdf
 
@@ -158,21 +158,66 @@ class RewriteResponse(BaseModel):
     diff_summary: str
 
 
+# ── background audit runner ───────────────────────────────────────────────────
+
+async def _run_audit_background(audit_id: str, start_url: str, clean_domain: str) -> None:
+    """Full audit pipeline — runs after the POST response is sent."""
+    logger.info("Background audit started for %s (id=%s)", clean_domain, audit_id)
+    try:
+        # 1. Crawl
+        metrics = await run_full_audit(start_url)
+        logger.info("Crawl done for %s: %d pages", clean_domain, metrics.get("pages_crawled", 0))
+
+        # 2. PageSpeed
+        pagespeed = await _run_pagespeed(start_url)
+
+        # 3. AI analysis
+        try:
+            ai_recs = await analyze_seo(metrics)
+        except Exception as exc:
+            logger.warning("AI analysis failed: %s", exc)
+            ai_recs = {"overall_score": 0, "summary": str(exc), "critical_issues": [], "quick_wins": []}
+        ai_recs = _parse_ai_recommendations(ai_recs)
+
+        # 4. Write results to Supabase (overwrite the placeholder)
+        await update_audit(audit_id, {
+            "metrics": metrics,
+            "pagespeed": pagespeed,
+            "ai_insights": ai_recs,
+        })
+        logger.info("Audit %s saved to Supabase", audit_id)
+
+        # 5. PDF (non-blocking)
+        try:
+            pdf_url = await generate_and_store_pdf(clean_domain, audit_id, metrics, ai_recs)
+            if pdf_url:
+                await update_pdf_url(audit_id, pdf_url)
+        except Exception as exc:
+            logger.error("PDF generation failed for %s: %s", audit_id, exc, exc_info=True)
+
+        logger.info("Background audit complete for %s", clean_domain)
+
+    except Exception as exc:
+        logger.exception("Background audit crashed for %s", clean_domain)
+        # Mark as errored so the frontend stops polling
+        await update_audit(audit_id, {
+            "metrics": {"pages_crawled": 0, "_error": str(exc)[:200]},
+            "ai_insights": {"overall_score": 0, "summary": f"Audit failed: {str(exc)[:200]}", "critical_issues": [], "quick_wins": []},
+        })
+
+
 # ── endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/audit/{domain:path}", response_model=AuditResult)
-async def create_audit(domain: str):
+async def create_audit(domain: str, background_tasks: BackgroundTasks):
     start_url = _normalise_domain(domain)
     clean_domain = urlparse(start_url).netloc
 
-    # Return cached result
+    # Return cached result if one exists
     existing = await get_audit_by_domain(clean_domain)
     if existing:
         logger.info("Returning cached audit for %s", clean_domain)
-        
-        # Parse potential string records into a verified dict format
         parsed_ai_recs = _parse_ai_recommendations(existing.get("ai_insights"))
-        
         return AuditResult(
             id=existing["id"],
             domain=clean_domain,
@@ -184,63 +229,30 @@ async def create_audit(domain: str):
             pdf_url=existing.get("pdf_url"),
         )
 
-    logger.info("Starting fresh audit for %s", start_url)
-
-    # 1. Crawl
-    try:
-        metrics = await run_full_audit(start_url)
-    except Exception as exc:
-        logger.exception("Crawler failed for %s", start_url)
-        raise HTTPException(status_code=500, detail=f"Crawler error: {exc}")
-
-    # 2. PageSpeed
-    logger.info(f"Calling PageSpeed API for {start_url}")
-    pagespeed = await _run_pagespeed(start_url)
-    if pagespeed:
-        logger.info(f"PageSpeed results: {pagespeed}")
-    else:
-        logger.warning(f"PageSpeed returned None for {start_url}")
-
-    # 3. AI analysis
-    try:
-        ai_recs = await analyze_seo(metrics)
-    except Exception as exc:
-        logger.warning("AI analysis failed: %s", exc)
-        ai_recs = {"overall_score": 0, "summary": str(exc), "critical_issues": [], "quick_wins": []}
-
-    # Ensure memory reference is a clean dictionary format before storage
-    ai_recs = _parse_ai_recommendations(ai_recs)
-
-    # 4. Save to Supabase
+    # Create a "processing" placeholder — returns immediately to the client
     saved = await save_audit({
         "domain": clean_domain,
-        "metrics": metrics,
-        "pagespeed": pagespeed,
-        "ai_insights": ai_recs,
+        "metrics": {"pages_crawled": 0, "_processing": True},
+        "pagespeed": None,
+        "ai_insights": {},
     })
-    audit_id = saved.get("id") if saved else None
+    audit_id = saved.get("id")
+    if not audit_id:
+        raise HTTPException(status_code=500, detail="Failed to create audit record")
 
-    # 5. Generate PDF + upload to Supabase Storage (non-blocking on failure)
-    pdf_url: str | None = None
-    if audit_id:
-        try:
-            pdf_url = await generate_and_store_pdf(clean_domain, audit_id, metrics, ai_recs)
-            if pdf_url:
-                await update_pdf_url(audit_id, pdf_url)
-            else:
-                logger.warning("PDF generation returned null for %s", audit_id)
-        except Exception as exc:
-            logger.error("PDF generation/upload raised exception: %s", exc, exc_info=True)
+    logger.info("Created processing placeholder %s for %s", audit_id, clean_domain)
+
+    # Queue full audit to run after this response is sent
+    background_tasks.add_task(_run_audit_background, audit_id, start_url, clean_domain)
 
     return AuditResult(
         id=audit_id,
         domain=clean_domain,
-        status="completed",
-        pages_crawled=metrics.get("pages_crawled", 0),
-        metrics=metrics,
-        pagespeed=pagespeed,
-        ai_recommendations=ai_recs,
-        pdf_url=pdf_url,
+        status="processing",
+        pages_crawled=0,
+        metrics={},
+        pagespeed=None,
+        ai_recommendations={},
     )
 
 
@@ -249,16 +261,40 @@ async def get_audit_endpoint(audit_id: str):
     record = await get_audit(audit_id)
     if not record:
         raise HTTPException(status_code=404, detail="Audit not found")
-        
-    # Safeguard against string conversions on direct entry fetches
+
+    metrics = record.get("metrics", {})
+    # _processing flag means background task hasn't finished yet
+    if metrics.get("_processing"):
+        return AuditResult(
+            id=record["id"],
+            domain=record["domain"],
+            status="processing",
+            pages_crawled=0,
+            metrics={},
+            pagespeed=None,
+            ai_recommendations={},
+        )
+
+    # _error flag means background task crashed
+    if metrics.get("_error"):
+        parsed_ai_recs = _parse_ai_recommendations(record.get("ai_insights"))
+        return AuditResult(
+            id=record["id"],
+            domain=record["domain"],
+            status="error",
+            pages_crawled=0,
+            metrics={},
+            pagespeed=None,
+            ai_recommendations=parsed_ai_recs,
+        )
+
     parsed_ai_recs = _parse_ai_recommendations(record.get("ai_insights"))
-    
     return AuditResult(
         id=record["id"],
         domain=record["domain"],
         status="completed",
-        pages_crawled=record.get("metrics", {}).get("pages_crawled", 0),
-        metrics=record.get("metrics", {}),
+        pages_crawled=metrics.get("pages_crawled", 0),
+        metrics=metrics,
         pagespeed=record.get("pagespeed"),
         ai_recommendations=parsed_ai_recs,
         pdf_url=record.get("pdf_url"),
