@@ -16,6 +16,17 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_recommendation_text(html_text: str) -> str:
+    """Remove all HTML tags and escape content for safe PDF rendering."""
+    if not html_text:
+        return ""
+    # Remove all HTML tags
+    text = re.sub(r'<[^>]+>', '', html_text)
+    # Unescape common HTML entities
+    text = text.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+    return text.strip()
+
 METRIC_LABELS = {
     "http_errors":                      "4xx / 5xx Errors",
     "missing_h1":                       "Missing H1 Tags",
@@ -126,18 +137,27 @@ def _build_pdf_bytes(domain: str, metrics: dict, ai_insights: dict | None) -> by
     if ai_insights and ai_insights.get("critical_issues"):
         story.append(Paragraph("Critical Issues & Fixes", styles["Heading2"]))
         for issue in ai_insights["critical_issues"][:5]:
-            story.append(Paragraph(
-                f"<b>#{issue.get('rank', '?')} {issue.get('issue', '')}</b> "
-                f"(Priority: {issue.get('priority_score', '')})",
-                styles["Normal"],
-            ))
-            if issue.get("why_it_matters"):
-                story.append(Paragraph(f"Why: {issue['why_it_matters']}", styles["Normal"]))
-            if issue.get("fix"):
-                story.append(Paragraph(f"Fix: {issue['fix']}", styles["Normal"]))
-            if issue.get("estimated_impact"):
-                story.append(Paragraph(f"Impact: {issue['estimated_impact']}", styles["Normal"]))
-            story.append(Spacer(1, 0.3 * cm))
+            try:
+                issue_title = _sanitize_recommendation_text(issue.get('issue', ''))
+                priority = issue.get('priority_score', '?')
+                story.append(Paragraph(
+                    f"<b>#{issue.get('rank', '?')} {issue_title}</b> "
+                    f"(Priority: {priority})",
+                    styles["Normal"],
+                ))
+                if issue.get("why_it_matters"):
+                    why_text = _sanitize_recommendation_text(issue['why_it_matters'])
+                    story.append(Paragraph(f"Why: {why_text}", styles["Normal"]))
+                if issue.get("fix"):
+                    fix_text = _sanitize_recommendation_text(issue['fix'])
+                    story.append(Paragraph(f"Fix: {fix_text}", styles["Normal"]))
+                if issue.get("estimated_impact"):
+                    impact_text = _sanitize_recommendation_text(issue['estimated_impact'])
+                    story.append(Paragraph(f"Impact: {impact_text}", styles["Normal"]))
+                story.append(Spacer(1, 0.3 * cm))
+            except Exception as e:
+                logger.warning(f"Failed to add issue to PDF: {e}")
+                continue
 
     # Quick wins
     if ai_insights and ai_insights.get("quick_wins"):
@@ -187,15 +207,24 @@ def _save_to_tmp(pdf_bytes: bytes, audit_id: str) -> str:
 
 # ── public entry point ─────────────────────────────────────────────────────
 
-async def generate_and_store_pdf(domain: str, audit_id: str, metrics: dict, ai_insights: dict | None) -> str:
+async def generate_and_store_pdf(domain: str, audit_id: str, metrics: dict, ai_insights: dict | None):
     """
     Build PDF in memory, upload to Supabase Storage, return public URL.
     Falls back to /tmp path if Supabase upload fails.
+    Returns None if PDF generation fails (audit continues without PDF).
     """
-    pdf_bytes = _build_pdf_bytes(domain, metrics, ai_insights)
+    try:
+        pdf_bytes = _build_pdf_bytes(domain, metrics, ai_insights)
+    except Exception as exc:
+        logger.error("PDF generation failed for %s (%s): %s", audit_id, domain, exc, exc_info=True)
+        return None
 
     try:
         return _upload_to_supabase(pdf_bytes, domain, audit_id)
     except Exception as exc:
         logger.warning("Supabase PDF upload failed (%s), falling back to /tmp", exc)
-        return _save_to_tmp(pdf_bytes, audit_id)
+        try:
+            return _save_to_tmp(pdf_bytes, audit_id)
+        except Exception as fallback_exc:
+            logger.error("PDF fallback storage also failed for %s: %s", audit_id, fallback_exc)
+            return None

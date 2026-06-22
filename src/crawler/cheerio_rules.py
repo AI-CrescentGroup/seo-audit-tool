@@ -765,7 +765,6 @@ async def _calculate_geo_score_for_page(
     page_url = page.get("url", "unknown")
 
     if not page["html"]:
-        logger.debug(f"GEO: skipping {page_url} — no HTML content")
         return {
             "url": page_url,
             "geo_score": 0,
@@ -774,124 +773,99 @@ async def _calculate_geo_score_for_page(
         }
 
     html = page["html"]
+    soup = BeautifulSoup(html, "html.parser")
 
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-    except Exception as e:
-        logger.warning(f"GEO: BeautifulSoup parse failed for {page_url}: {e}")
-        return {
-            "url": page_url,
-            "geo_score": 0,
-            "geo_signals": {},
-            "geo_issues": ["Failed to parse HTML"],
-        }
+    # Extract body text once
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    body_text = soup.get_text(separator=" ", strip=True)
+    body_text = re.sub(r"\s+", " ", body_text)
+
+    # Initialize all signals to 0
+    faq_present = False
+    entity_density = 0
+    answer_density_score = 0
+    heading_structure_score = 0
+    content_freshness_score = 0
+    readability_score = 0
 
     # 1. FAQ Schema Present
-    faq_present = False
     try:
         faq_script = soup.find("script", attrs={"type": "application/ld+json"})
         if faq_script:
-            try:
-                data = json.loads(faq_script.string or "{}")
-                faq_present = data.get("@type") == "FAQPage" or "FAQPage" in str(data)
-            except json.JSONDecodeError as e:
-                logger.debug(f"GEO: FAQ schema parse failed for {page_url}: {e}")
-                faq_present = False
+            data = json.loads(faq_script.string or "{}")
+            faq_present = data.get("@type") == "FAQPage" or "FAQPage" in str(data)
     except Exception as e:
-        logger.error(f"GEO: FAQ schema detection failed for {page_url}: {e}")
+        logger.warning(f"GEO signal 1 (FAQ) failed for {page_url}: {e}")
         faq_present = False
 
-    # Extract body text
-    try:
-        for tag in soup(["script", "style"]):
-            tag.decompose()
-        body_text = soup.get_text(separator=" ", strip=True)
-        body_text = re.sub(r"\s+", " ", body_text)
-    except Exception as e:
-        logger.warning(f"GEO: text extraction failed for {page_url}: {e}")
-        body_text = ""
-
     # 2. Entity Density
-    entity_density = 0
     try:
         entity_count = _extract_entity_names(body_text)
         word_count = len(body_text.split())
         entity_density = (entity_count / word_count * 100) if word_count > 0 else 0
     except Exception as e:
-        logger.error(f"GEO: entity density calculation failed for {page_url}: {e}")
+        logger.warning(f"GEO signal 2 (entity density) failed for {page_url}: {e}")
         entity_density = 0
 
     # 3. Answer Density
-    answer_density_score = 0
     try:
         answer_density_score = _score_answer_density(body_text, first_n_words=100)
     except Exception as e:
-        logger.error(f"GEO: answer density scoring failed for {page_url}: {e}")
+        logger.warning(f"GEO signal 3 (answer density) failed for {page_url}: {e}")
         answer_density_score = 0
 
     # 4. Heading Structure
-    heading_structure_score = 0
     try:
         heading_structure_score = _score_heading_structure(soup)
     except Exception as e:
-        logger.error(f"GEO: heading structure scoring failed for {page_url}: {e}")
+        logger.warning(f"GEO signal 4 (heading structure) failed for {page_url}: {e}")
         heading_structure_score = 0
 
     # 5. Content Freshness
-    content_freshness_score = 0
     try:
         headers = response_headers or {}
         content_freshness_score = _extract_content_freshness_score(html, headers)
     except Exception as e:
-        logger.error(f"GEO: content freshness scoring failed for {page_url}: {e}")
+        logger.warning(f"GEO signal 5 (content freshness) failed for {page_url}: {e}")
         content_freshness_score = 0
 
     # 6. Readability
-    readability_score = 0
     try:
         readability_score = _calculate_readability_score(body_text)
     except Exception as e:
-        logger.error(f"GEO: readability scoring failed for {page_url}: {e}")
+        logger.warning(f"GEO signal 6 (readability) failed for {page_url}: {e}")
         readability_score = 0
 
     # Combine into GEO Score (0–10)
-    try:
-        geo_score = round(
-            (faq_present * 2)
-            + min(2, entity_density / 3)
-            + (answer_density_score / 2.5)
-            + heading_structure_score
-            + content_freshness_score
-            + readability_score,
-            1,
-        )
-    except Exception as e:
-        logger.error(f"GEO: score aggregation failed for {page_url}: {e}")
-        geo_score = 0
+    geo_score = round(
+        (faq_present * 2)
+        + min(2, entity_density / 3)
+        + (answer_density_score / 2.5)
+        + heading_structure_score
+        + content_freshness_score
+        + readability_score,
+        1,
+    )
 
     # Generate issues
     geo_issues = []
-    try:
-        if not faq_present:
-            geo_issues.append("Missing FAQ schema — add FAQPage JSON-LD to improve LLM citability")
-        if entity_density < 3:
-            geo_issues.append(
-                f"Entity density low ({entity_density:.1f} per 100 words) — mention more named entities"
-            )
-        if answer_density_score < 3:
-            geo_issues.append(
-                "Answer density low — provide direct answers to target queries in opening 100 words"
-            )
-        if heading_structure_score < 2:
-            geo_issues.append("Heading structure needs improvement — use logical H1/H2/H3 hierarchy")
-        if content_freshness_score == 0:
-            geo_issues.append("Content appears outdated — update last-modified date or publish metadata")
-        if readability_score < 2:
-            geo_issues.append("Readability too high (grade >12) — simplify language for LLM consumption")
-    except Exception as e:
-        logger.error(f"GEO: issue generation failed for {page_url}: {e}")
-
-    logger.debug(f"GEO: {page_url} scored {geo_score}/10 (FAQ:{faq_present}, entity:{entity_density:.1f}, answer:{answer_density_score}, heading:{heading_structure_score}, freshness:{content_freshness_score}, readability:{readability_score})")
+    if not faq_present:
+        geo_issues.append("Missing FAQ schema — add FAQPage JSON-LD to improve LLM citability")
+    if entity_density < 3:
+        geo_issues.append(
+            f"Entity density low ({entity_density:.1f} per 100 words) — mention more named entities"
+        )
+    if answer_density_score < 3:
+        geo_issues.append(
+            "Answer density low — provide direct answers to target queries in opening 100 words"
+        )
+    if heading_structure_score < 2:
+        geo_issues.append("Heading structure needs improvement — use logical H1/H2/H3 hierarchy")
+    if content_freshness_score == 0:
+        geo_issues.append("Content appears outdated — update last-modified date or publish metadata")
+    if readability_score < 2:
+        geo_issues.append("Readability too high (grade >12) — simplify language for LLM consumption")
 
     return {
         "url": page_url,
@@ -922,53 +896,49 @@ async def run_full_audit(start_url: str) -> dict:
         metric_image_file_size_issues(pages),
     )
 
-    # TEMPORARILY DISABLED FOR DEBUGGING
     # Calculate GEO scores for each page with error handling
-    # logger.info(f"Starting GEO scoring for {len(pages)} pages")
-    # geo_scores = []
-    # geo_failed_count = 0
-    #
-    # try:
-    #     geo_results = await asyncio.gather(
-    #         *[_calculate_geo_score_for_page(p, {}) for p in pages],
-    #         return_exceptions=True,  # Don't fail on individual page errors
-    #     )
-    #
-    #     for idx, result in enumerate(geo_results):
-    #         if isinstance(result, Exception):
-    #             page_url = pages[idx].get("url", f"page_{idx}") if idx < len(pages) else f"page_{idx}"
-    #             logger.error(f"GEO scoring crashed for {page_url}: {result}")
-    #             geo_failed_count += 1
-    #             # Create a fallback score for this page
-    #             geo_scores.append({
-    #                 "url": page_url,
-    #                 "geo_score": 0,
-    #                 "geo_signals": {},
-    #                 "geo_issues": [f"GEO scoring error: {str(result)[:100]}"],
-    #             })
-    #         else:
-    #             geo_scores.append(result)
-    # except Exception as e:
-    #     logger.exception(f"CRITICAL: GEO scoring batch processing failed: {e}")
-    #     geo_scores = []
-    #     geo_failed_count = len(pages)
-    #
-    # # Aggregate GEO scores
-    # avg_geo_score = 0
-    # try:
-    #     if geo_scores:
-    #         valid_scores = [g.get("geo_score", 0) for g in geo_scores if isinstance(g, dict)]
-    #         avg_geo_score = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0
-    # except Exception as e:
-    #     logger.error(f"GEO score aggregation failed: {e}")
-    #     avg_geo_score = 0
-    #
-    # logger.info(f"GEO scoring complete: {len(geo_scores) - geo_failed_count} pages scored, {geo_failed_count} failed")
-
-    # Stub values for disabled GEO scoring
+    logger.info(f"Starting GEO scoring for {len(pages)} pages")
     geo_scores = []
+    scored_count = 0
+    failed_count = 0
+
+    try:
+        geo_results = await asyncio.gather(
+            *[_calculate_geo_score_for_page(p, {}) for p in pages],
+            return_exceptions=True,  # Don't fail on individual page errors
+        )
+
+        for idx, result in enumerate(geo_results):
+            if isinstance(result, Exception):
+                page_url = pages[idx].get("url", f"page_{idx}") if idx < len(pages) else f"page_{idx}"
+                logger.error(f"GEO scoring exception for {page_url}: {result}")
+                failed_count += 1
+                # Create a fallback score for this page
+                geo_scores.append({
+                    "url": page_url,
+                    "geo_score": 0,
+                    "geo_signals": {},
+                    "geo_issues": [f"GEO scoring error: {str(result)[:100]}"],
+                })
+            else:
+                geo_scores.append(result)
+                scored_count += 1
+    except Exception as e:
+        logger.exception(f"CRITICAL: GEO scoring batch processing failed: {e}")
+        geo_scores = []
+        failed_count = len(pages)
+
+    # Aggregate GEO scores
     avg_geo_score = 0
-    logger.info("GEO scoring DISABLED for debugging")
+    try:
+        if geo_scores:
+            valid_scores = [g.get("geo_score", 0) for g in geo_scores if isinstance(g, dict)]
+            avg_geo_score = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0
+    except Exception as e:
+        logger.error(f"GEO score aggregation failed: {e}")
+        avg_geo_score = 0
+
+    logger.info(f"GEO scoring complete: {scored_count} pages scored, {failed_count} failed")
 
     return {
         "pages_crawled": len(pages),

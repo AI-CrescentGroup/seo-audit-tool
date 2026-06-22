@@ -43,6 +43,7 @@ def _parse_ai_recommendations(ai_insights) -> dict:
 async def _run_pagespeed(url: str) -> dict | None:
     key = os.environ.get("PAGESPEED_API_KEY")
     if not key:
+        logger.info("PageSpeed API: no key configured")
         return None
     try:
         import httpx
@@ -53,15 +54,44 @@ async def _run_pagespeed(url: str) -> dict | None:
             )
             resp.raise_for_status()
             data = resp.json()
-        cats = data.get("lighthouseResult", {}).get("categories", {})
-        return {
-            "performance":    round((cats.get("performance",    {}).get("score") or 0) * 100),
-            "seo":            round((cats.get("seo",            {}).get("score") or 0) * 100),
-            "accessibility":  round((cats.get("accessibility",  {}).get("score") or 0) * 100),
-            "best_practices": round((cats.get("best-practices", {}).get("score") or 0) * 100),
-        }
+
+        # Debug: log the actual response structure
+        logger.debug(f"PageSpeed API response keys: {data.keys()}")
+
+        lighthouse = data.get("lighthouseResult", {})
+        if not lighthouse:
+            logger.warning(f"PageSpeed API: no lighthouseResult in response for {url}")
+            return None
+
+        cats = lighthouse.get("categories", {})
+        if not cats:
+            logger.warning(f"PageSpeed API: no categories in lighthouse result for {url}")
+            logger.debug(f"Lighthouse keys: {lighthouse.keys()}")
+            return None
+
+        logger.debug(f"PageSpeed categories found: {cats.keys()}")
+
+        # Extract scores with detailed logging
+        result = {}
+        for metric_name, category_key in [
+            ("performance", "performance"),
+            ("seo", "seo"),
+            ("accessibility", "accessibility"),
+            ("best_practices", "best-practices"),
+        ]:
+            category = cats.get(category_key, {})
+            score = category.get("score")
+            if score is None:
+                logger.warning(f"PageSpeed: {category_key} score is None/missing")
+                result[metric_name] = 0
+            else:
+                result[metric_name] = round(score * 100)
+                logger.debug(f"PageSpeed: {metric_name} = {score} → {result[metric_name]}")
+
+        logger.info(f"PageSpeed API success for {url}: {result}")
+        return result
     except Exception as exc:
-        logger.warning("PageSpeed API failed: %s", exc)
+        logger.error(f"PageSpeed API failed for {url}: {exc}", exc_info=True)
         return None
 
 
@@ -128,7 +158,12 @@ async def create_audit(domain: str):
         raise HTTPException(status_code=500, detail=f"Crawler error: {exc}")
 
     # 2. PageSpeed
+    logger.info(f"Calling PageSpeed API for {start_url}")
     pagespeed = await _run_pagespeed(start_url)
+    if pagespeed:
+        logger.info(f"PageSpeed results: {pagespeed}")
+    else:
+        logger.warning(f"PageSpeed returned None for {start_url}")
 
     # 3. AI analysis
     try:
@@ -154,9 +189,12 @@ async def create_audit(domain: str):
     if audit_id:
         try:
             pdf_url = await generate_and_store_pdf(clean_domain, audit_id, metrics, ai_recs)
-            await update_pdf_url(audit_id, pdf_url)
+            if pdf_url:
+                await update_pdf_url(audit_id, pdf_url)
+            else:
+                logger.warning("PDF generation returned null for %s", audit_id)
         except Exception as exc:
-            logger.warning("PDF generation/upload failed: %s", exc)
+            logger.error("PDF generation/upload raised exception: %s", exc, exc_info=True)
 
     return AuditResult(
         id=audit_id,
