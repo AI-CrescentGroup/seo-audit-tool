@@ -117,46 +117,47 @@ async def _fetch_sitemap_urls(start_url: str) -> set[str]:
 async def crawl_site(start_url: str) -> list[dict]:
     """
     BFS crawl starting from start_url.
-    1. First loads URLs from sitemap.xml (catches JS-generated pages)
-    2. Then does BFS crawl to find remaining pages
-    Returns list of page dicts (url, status, html, redirect_chain, load_ms, error).
+    1. Seeds queue from sitemap.xml (catches JS-generated pages BFS would miss)
+    2. BFS crawl discovers any additional pages via link extraction
+    Uses separate 'queued' set (dedup queue entries) vs results list (track fetched).
     """
     parsed = urlparse(start_url)
     domain = parsed.netloc.lstrip("www.")
-    visited: set[str] = set()
+    # 'queued' tracks URLs already added to queue — prevents duplicate queue entries.
+    # Do NOT confuse with fetched. A URL is queued before it's fetched.
+    queued: set[str] = set()
     queue: asyncio.Queue = asyncio.Queue()
 
-    # Load sitemap URLs first (this catches JS-generated pages that BFS misses)
+    # Seed from sitemap first — discovers JS-rendered pages BFS can't see
     logger.info(f"Attempting to load sitemap.xml for {start_url}")
     sitemap_urls = await _fetch_sitemap_urls(start_url)
     if sitemap_urls:
         logger.info(f"Queuing {len(sitemap_urls)} URLs from sitemap")
         for url in sitemap_urls:
             queue.put_nowait(url)
-            visited.add(url)  # Mark as visited to avoid re-crawling
+            queued.add(url)
     else:
         logger.info("No sitemap.xml found, using BFS crawl only")
 
-    # Always queue the start URL (in case it wasn't in sitemap)
+    # Always include start URL
     start_norm = _norm(start_url)
-    if start_norm not in visited:
+    if start_norm not in queued:
         queue.put_nowait(start_norm)
+        queued.add(start_norm)
 
     results: list[dict] = []
+    pages_from_sitemap = 0
+    pages_from_bfs = 0
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False) as client:
-        pages_from_sitemap = 0
-        pages_from_bfs = 0
 
         while not queue.empty() and len(results) < MAX_PAGES:
             batch = []
-            while not queue.empty() and len(batch) < CONCURRENCY and len(results) < MAX_PAGES:
+            while not queue.empty() and len(batch) < CONCURRENCY and len(results) + len(batch) < MAX_PAGES:
                 try:
                     url = queue.get_nowait()
-                    if url not in visited:
-                        visited.add(url)
-                        batch.append(url)
+                    batch.append(url)  # All queue entries are already deduped via 'queued'
                 except asyncio.QueueEmpty:
                     break
 
@@ -167,11 +168,10 @@ async def crawl_site(start_url: str) -> list[dict]:
                 async with sem:
                     return await _fetch(client, u)
 
-            pages = await asyncio.gather(*[fetch_one(u) for u in batch])
+            fetched = await asyncio.gather(*[fetch_one(u) for u in batch])
 
-            for page in pages:
+            for page in fetched:
                 results.append(page)
-                # Track whether this came from sitemap or BFS discovery
                 if page["url"] in sitemap_urls:
                     pages_from_sitemap += 1
                 else:
@@ -184,8 +184,9 @@ async def crawl_site(start_url: str) -> list[dict]:
                         if href.startswith(("mailto:", "tel:", "javascript:", "#")):
                             continue
                         full = _norm(urljoin(page["url"], href))
-                        if _same_domain(full, domain) and full not in visited:
+                        if _same_domain(full, domain) and full not in queued:
                             queue.put_nowait(full)
+                            queued.add(full)
 
     logger.info(f"Crawled {len(results)} pages for {domain}: {pages_from_sitemap} from sitemap, {pages_from_bfs} from BFS discovery")
     return results
