@@ -41,57 +41,93 @@ def _parse_ai_recommendations(ai_insights) -> dict:
 
 
 async def _run_pagespeed(url: str) -> dict | None:
+    """
+    Fetch PageSpeed Insights scores for all 4 metrics.
+    Uses strategy=desktop to ensure all metrics are returned.
+    """
     key = os.environ.get("PAGESPEED_API_KEY")
     if not key:
-        logger.info("PageSpeed API: no key configured")
+        logger.info("PageSpeed API: PAGESPEED_API_KEY not configured")
         return None
+
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
-                "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
-                params={"url": url, "strategy": "mobile", "key": key},
-            )
+
+        # Use desktop strategy to get all metrics (mobile may not return SEO/Accessibility/Best Practices)
+        strategy = "desktop"
+        api_url = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+        params = {
+            "url": url,
+            "strategy": strategy,
+            "key": key,
+            "category": ["performance", "seo", "accessibility", "best-practices"],  # Explicitly request all categories
+        }
+
+        logger.info(f"PageSpeed API: calling {api_url} with strategy={strategy} for {url}")
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(api_url, params=params)
             resp.raise_for_status()
-            data = resp.json()
+            response_json = resp.json()
 
-        # Debug: log the actual response structure
-        logger.debug(f"PageSpeed API response keys: {data.keys()}")
+        # Log full response for debugging
+        logger.debug(f"PageSpeed full response: {json.dumps(response_json, indent=2)}")
 
-        lighthouse = data.get("lighthouseResult", {})
+        # Navigate to lighthouseResult
+        lighthouse = response_json.get("lighthouseResult")
         if not lighthouse:
-            logger.warning(f"PageSpeed API: no lighthouseResult in response for {url}")
+            logger.error(f"PageSpeed: no lighthouseResult in response for {url}")
+            logger.error(f"Response keys: {response_json.keys()}")
             return None
 
-        cats = lighthouse.get("categories", {})
-        if not cats:
-            logger.warning(f"PageSpeed API: no categories in lighthouse result for {url}")
-            logger.debug(f"Lighthouse keys: {lighthouse.keys()}")
+        # Get categories
+        categories = lighthouse.get("categories", {})
+        if not categories:
+            logger.error(f"PageSpeed: no categories found in lighthouseResult for {url}")
+            logger.error(f"Lighthouse keys: {lighthouse.keys()}")
             return None
 
-        logger.debug(f"PageSpeed categories found: {cats.keys()}")
+        logger.info(f"PageSpeed: categories found: {list(categories.keys())}")
 
-        # Extract scores with detailed logging
-        result = {}
-        for metric_name, category_key in [
+        # Parse all 4 metrics with detailed logging
+        pagespeed_scores = {
+            "performance": 0,
+            "seo": 0,
+            "accessibility": 0,
+            "best_practices": 0,
+        }
+
+        # Map API category names to our output keys
+        category_mappings = [
             ("performance", "performance"),
             ("seo", "seo"),
             ("accessibility", "accessibility"),
-            ("best_practices", "best-practices"),
-        ]:
-            category = cats.get(category_key, {})
-            score = category.get("score")
-            if score is None:
-                logger.warning(f"PageSpeed: {category_key} score is None/missing")
-                result[metric_name] = 0
-            else:
-                result[metric_name] = round(score * 100)
-                logger.debug(f"PageSpeed: {metric_name} = {score} → {result[metric_name]}")
+            ("best-practices", "best_practices"),  # API uses hyphen, we use underscore
+        ]
 
-        logger.info(f"PageSpeed API success for {url}: {result}")
-        return result
+        for api_category_name, output_key in category_mappings:
+            category_data = categories.get(api_category_name)
+
+            if not category_data:
+                logger.warning(f"PageSpeed: category '{api_category_name}' not found in response")
+                pagespeed_scores[output_key] = 0
+                continue
+
+            score = category_data.get("score")
+
+            if score is None:
+                logger.warning(f"PageSpeed: category '{api_category_name}' has no score")
+                pagespeed_scores[output_key] = 0
+            else:
+                # Score is 0-1, multiply by 100 for 0-100 scale
+                pagespeed_scores[output_key] = round(score * 100)
+                logger.info(f"PageSpeed: {output_key} = {score} → {pagespeed_scores[output_key]}/100")
+
+        logger.info(f"PageSpeed final scores: {pagespeed_scores}")
+        return pagespeed_scores
+
     except Exception as exc:
-        logger.error(f"PageSpeed API failed for {url}: {exc}", exc_info=True)
+        logger.error(f"PageSpeed API error for {url}: {exc}", exc_info=True)
         return None
 
 
