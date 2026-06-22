@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src.api.routes import router
+from src.api.routes_geo_rewrite import router as router_geo_rewrite
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +110,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 app.include_router(router, prefix="/api")
+app.include_router(router_geo_rewrite)
 
 
 @app.get("/health")
