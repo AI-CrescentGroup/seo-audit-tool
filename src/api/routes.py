@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from src.crawler.cheerio_rules import run_full_audit
 from src.database.db import get_audit, get_audit_by_domain, list_audits, save_audit, update_pdf_url
-from src.utils.ai_analyzer import analyze_seo
+from src.utils.ai_analyzer import analyze_seo, rewrite_for_geo
 from src.utils.pdf_generator import generate_and_store_pdf
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,20 @@ class AuditResult(BaseModel):
     pagespeed: dict | None = None
     ai_recommendations: dict = {}
     pdf_url: str | None = None
+
+
+class RewriteRequest(BaseModel):
+    page_url: str
+    target_keyword: str
+    page_content: str
+
+
+class RewriteResponse(BaseModel):
+    original_content: str
+    rewritten_content: str
+    faq_block: str
+    json_ld_schema: dict
+    diff_summary: str
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
@@ -210,3 +224,22 @@ async def get_pdf(audit_id: str):
 @router.get("/audits")
 async def list_audits_endpoint(limit: int = 20, offset: int = 0):
     return await list_audits(limit=limit, offset=offset)
+
+
+@router.post("/audit/{audit_id}/rewrite", response_model=RewriteResponse)
+async def rewrite_page(audit_id: str, req: RewriteRequest):
+    """Rewrite page content for GEO (Generative Engine Optimization)."""
+    record = await get_audit(audit_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Audit not found")
+
+    try:
+        result = await rewrite_for_geo(
+            page_url=req.page_url,
+            target_keyword=req.target_keyword,
+            page_content=req.page_content,
+        )
+        return result
+    except Exception as exc:
+        logger.exception("Rewrite failed for %s", req.page_url)
+        raise HTTPException(status_code=500, detail=f"Rewrite error: {exc}")

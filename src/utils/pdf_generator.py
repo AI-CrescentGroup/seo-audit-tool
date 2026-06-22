@@ -87,6 +87,15 @@ def _build_pdf_bytes(domain: str, metrics: dict, ai_insights: dict | None) -> by
     score_style = ParagraphStyle("Score", parent=styles["Heading1"], textColor=_score_color(score))
     story.append(Paragraph(f"Overall SEO Score: {score}/100", score_style))
 
+    # GEO Score (if available)
+    geo_score = metrics.get("geo_score", {})
+    if isinstance(geo_score, dict) and "average" in geo_score:
+        geo_avg = geo_score.get("average", 0)
+        geo_color = _score_color(int(geo_avg * 10))  # Scale 0-10 to 0-100
+        geo_style = ParagraphStyle("GEOScore", parent=styles["Heading2"], textColor=geo_color)
+        story.append(Paragraph(f"GEO Score (LLM Optimization): {geo_avg}/10", geo_style))
+        story.append(Spacer(1, 0.3 * cm))
+
     # AI summary
     if ai_insights and ai_insights.get("summary"):
         story.append(Paragraph(ai_insights["summary"], styles["Normal"]))

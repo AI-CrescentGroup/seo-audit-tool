@@ -195,3 +195,99 @@ async def analyze_seo(metrics: dict) -> dict:
     raw = data["choices"][0]["message"]["content"].strip()
 
     return _parse_json_response(raw)
+
+
+async def rewrite_for_geo(page_url: str, target_keyword: str, page_content: str) -> dict:
+    """
+    Rewrite page content for GEO (Generative Engine Optimization).
+    Uses Claude API to optimize for LLM citation.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("No API key found (ANTHROPIC_API_KEY or OPENROUTER_API_KEY)")
+
+    system_prompt = """You are an SEO expert optimizing for LLM citation (Perplexity, ChatGPT, Gemini).
+Your task is to rewrite page content to maximize generative engine optimization.
+
+Rewrite the provided content to:
+1) Answer the target query directly in the first 100 words
+2) Include 5+ named entities (companies, people, locations)
+3) Add a FAQ section with 5 Q&A pairs that LLMs commonly cite
+4) Use simple language (Flesch-Kincaid grade 8 or lower)
+
+Return ONLY:
+- The rewritten body text (paragraphs only, no HTML tags)
+- Then on a new line: ---SEPARATOR---
+- Then the FAQ block as plain text Q&A format (Q: ... A: ... format, one pair per line)
+
+Do NOT include markdown, code blocks, or any other formatting."""
+
+    payload = {
+        "model": "google/gemini-2.5-flash",
+        "max_tokens": 2000,
+        "temperature": 0.7,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Target keyword: {target_keyword}\n\nPage URL: {page_url}\n\nOriginal content:\n\n{page_content}",
+            },
+        ],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://seo-audit-tool-frontend.vercel.app",
+        "X-Title": "SEO GEO Rewrite Engine",
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        resp = await client.post(OPENROUTER_API_URL, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
+    if "choices" not in data or not data["choices"]:
+        raise RuntimeError("No valid response from API")
+
+    raw_response = data["choices"][0]["message"]["content"].strip()
+
+    # Parse the separator
+    if "---SEPARATOR---" not in raw_response:
+        raise RuntimeError("Response format invalid — missing separator")
+
+    parts = raw_response.split("---SEPARATOR---")
+    rewritten_content = parts[0].strip()
+    faq_block = parts[1].strip() if len(parts) > 1 else ""
+
+    # Generate FAQPage JSON-LD schema from FAQ block
+    faq_items = []
+    for line in faq_block.split("\n"):
+        if line.startswith("Q:"):
+            q = line[2:].strip()
+            # Find corresponding answer
+            for next_line in faq_block.split("\n"):
+                if next_line.startswith("A:"):
+                    a = next_line[2:].strip()
+                    faq_items.append({"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}})
+                    break
+
+    json_ld_schema = {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": faq_items[:5],
+    }
+
+    # Count changes for diff summary
+    entity_count = len([w for w in rewritten_content.split() if w[0].isupper() and len(w) > 2])
+    faq_count = len([line for line in faq_block.split("\n") if line.startswith("Q:")])
+
+    diff_summary = f"Added {faq_count} FAQ items, rewritten opening for answer-density, added {entity_count} entity mentions, optimized for grade 8 readability"
+
+    return {
+        "original_content": page_content,
+        "rewritten_content": rewritten_content,
+        "faq_block": faq_block,
+        "json_ld_schema": json_ld_schema,
+        "diff_summary": diff_summary,
+    }

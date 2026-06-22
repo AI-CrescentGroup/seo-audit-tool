@@ -4,8 +4,10 @@ Site-wide SEO crawler — extracts 23 metrics across up to 500 pages.
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -615,10 +617,245 @@ async def metric_image_file_size_issues(pages: list[dict]) -> dict:
     }
 
 
+# ── GEO (Generative Engine Optimization) scoring ────────────────────────────────
+
+def _calculate_readability_score(text: str) -> int:
+    """
+    Flesch-Kincaid grade level. Returns 0–2 points.
+    Grade 8 or lower = 2, 8–12 = 1, >12 = 0 (simpler is better for LLMs).
+    """
+    if not text or len(text) < 50:
+        return 0
+
+    words = text.split()
+    sentences = len(re.split(r'[.!?]+', text)) - 1
+    syllables = sum(_count_syllables(word) for word in words)
+
+    if sentences == 0 or len(words) == 0:
+        return 0
+
+    grade = (0.39 * (len(words) / max(sentences, 1))) + (11.8 * (syllables / max(len(words), 1))) - 15.59
+    grade = max(0, grade)
+
+    if grade <= 8:
+        return 2
+    elif grade <= 12:
+        return 1
+    else:
+        return 0
+
+
+def _count_syllables(word: str) -> int:
+    """Rough syllable counter."""
+    word = word.lower()
+    vowels = "aeiouy"
+    syl_count = 0
+    previous_was_vowel = False
+    for char in word:
+        is_vowel = char in vowels
+        if is_vowel and not previous_was_vowel:
+            syl_count += 1
+        previous_was_vowel = is_vowel
+    if word.endswith("e"):
+        syl_count -= 1
+    if word.endswith("le") and len(word) > 2 and word[-3] not in vowels:
+        syl_count += 1
+    return max(1, syl_count)
+
+
+def _extract_entity_names(text: str) -> int:
+    """Count capitalized proper nouns (basic entity detection)."""
+    words = text.split()
+    entity_count = 0
+    for word in words:
+        # Basic heuristic: all-caps or starts with capital and has 2+ chars
+        if word and (word[0].isupper() and len(word) > 2):
+            if not word.endswith((".", ",", "!", "?")):
+                entity_count += 1
+    return entity_count
+
+
+def _score_heading_structure(soup: BeautifulSoup) -> int:
+    """Score heading hierarchy: 0–3 points."""
+    h1_count = len(soup.find_all("h1"))
+    h2_count = len(soup.find_all("h2"))
+    h3_count = len(soup.find_all("h3"))
+
+    score = 0
+    if h1_count == 1:
+        score += 1
+    if h2_count > 0 and h1_count == 1:
+        score += 1
+    if h3_count > 0 and h2_count > 0:
+        score += 1
+
+    return min(3, score)
+
+
+def _extract_content_freshness_score(html: str, response_headers: dict) -> int:
+    """Extract last-modified date. Returns 0–2 points."""
+    score = 0
+
+    # Check HTTP Last-Modified header
+    if "last-modified" in response_headers:
+        try:
+            from email.utils import parsedate_to_datetime
+            mod_date = parsedate_to_datetime(response_headers["last-modified"])
+            days_old = (datetime.utcnow() - mod_date.replace(tzinfo=None)).days
+            if days_old <= 90:
+                return 2
+            elif days_old <= 365:
+                return 1
+        except Exception:
+            pass
+
+    # Check <meta name="date-published"> or <meta name="last-modified">
+    soup = BeautifulSoup(html, "html.parser")
+    for meta_name in ["date-published", "last-modified", "article:published_time"]:
+        meta = soup.find("meta", attrs={"name": meta_name})
+        if not meta:
+            meta = soup.find("meta", attrs={"property": meta_name})
+        if meta:
+            try:
+                date_str = meta.get("content", "")
+                # Try parsing ISO format
+                date_obj = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                days_old = (datetime.utcnow() - date_obj.replace(tzinfo=None)).days
+                if days_old <= 90:
+                    return 2
+                elif days_old <= 365:
+                    return 1
+            except Exception:
+                pass
+
+    return 0
+
+
+def _score_answer_density(text: str, first_n_words: int = 100) -> int:
+    """
+    Check if first N words answer common queries.
+    Count how many question words (who/what/when/where/why/how) are answered.
+    Returns 0–5 points.
+    """
+    words = text.split()[:first_n_words]
+    first_100 = " ".join(words).lower()
+
+    # Look for direct answers: "is", "are", "provides", "includes", "offers", "contains"
+    direct_answer_patterns = [
+        r"\b(is|are|provides|includes|offers|contains|explains|shows|demonstrates|enables|allows)\b",
+    ]
+
+    score = 0
+    if any(re.search(pattern, first_100) for pattern in direct_answer_patterns):
+        score += 2
+
+    # Check for question words being addressed
+    question_words = ["who", "what", "when", "where", "why", "how"]
+    for qword in question_words:
+        if qword in first_100:
+            score += 0.5
+
+    return min(5, int(score))
+
+
+async def _calculate_geo_score_for_page(
+    page: dict, response_headers: dict = None
+) -> dict:
+    """Calculate GEO score (0–10) and signals for a single page."""
+    if not page["html"]:
+        return {
+            "url": page["url"],
+            "geo_score": 0,
+            "geo_signals": {},
+            "geo_issues": ["No HTML content to analyze"],
+        }
+
+    html = page["html"]
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. FAQ Schema Present
+    faq_present = bool(soup.find("script", attrs={"type": "application/ld+json"}))
+    faq_script = soup.find("script", attrs={"type": "application/ld+json"})
+    if faq_script:
+        try:
+            data = json.loads(faq_script.string or "{}")
+            faq_present = data.get("@type") == "FAQPage" or "FAQPage" in str(data)
+        except Exception:
+            faq_present = False
+
+    # Extract body text
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    body_text = soup.get_text(separator=" ", strip=True)
+    body_text = re.sub(r"\s+", " ", body_text)
+
+    # 2. Entity Density
+    entity_count = _extract_entity_names(body_text)
+    word_count = len(body_text.split())
+    entity_density = (entity_count / word_count * 100) if word_count > 0 else 0
+
+    # 3. Answer Density
+    answer_density_score = _score_answer_density(body_text, first_n_words=100)
+
+    # 4. Heading Structure
+    heading_structure_score = _score_heading_structure(soup)
+
+    # 5. Content Freshness
+    headers = response_headers or {}
+    content_freshness_score = _extract_content_freshness_score(html, headers)
+
+    # 6. Readability
+    readability_score = _calculate_readability_score(body_text)
+
+    # Combine into GEO Score (0–10)
+    geo_score = round(
+        (faq_present * 2)
+        + min(2, entity_density / 3)
+        + (answer_density_score / 2.5)
+        + heading_structure_score
+        + content_freshness_score
+        + readability_score,
+        1,
+    )
+
+    # Generate issues
+    geo_issues = []
+    if not faq_present:
+        geo_issues.append("Missing FAQ schema — add FAQPage JSON-LD to improve LLM citability")
+    if entity_density < 3:
+        geo_issues.append(
+            f"Entity density low ({entity_density:.1f} per 100 words) — mention more named entities"
+        )
+    if answer_density_score < 3:
+        geo_issues.append(
+            "Answer density low — provide direct answers to target queries in opening 100 words"
+        )
+    if heading_structure_score < 2:
+        geo_issues.append("Heading structure needs improvement — use logical H1/H2/H3 hierarchy")
+    if content_freshness_score == 0:
+        geo_issues.append("Content appears outdated — update last-modified date or publish metadata")
+    if readability_score < 2:
+        geo_issues.append("Readability too high (grade >12) — simplify language for LLM consumption")
+
+    return {
+        "url": page["url"],
+        "geo_score": geo_score,
+        "geo_signals": {
+            "faq_schema_present": faq_present,
+            "entity_density": round(entity_density, 2),
+            "answer_density_score": answer_density_score,
+            "heading_structure_score": heading_structure_score,
+            "content_freshness_score": content_freshness_score,
+            "readability_score": readability_score,
+        },
+        "geo_issues": geo_issues[:5],
+    }
+
+
 # ── main entry ────────────────────────────────────────────────────────────────
 
 async def run_full_audit(start_url: str) -> dict:
-    """Crawl the site and return all 23 metrics."""
+    """Crawl the site and return all 23 metrics + GEO scores per page."""
     pages = await crawl_site(start_url)
     crawled_urls = {p["url"] for p in pages}
 
@@ -628,6 +865,16 @@ async def run_full_audit(start_url: str) -> dict:
         metric_xml_sitemap_issues(start_url, pages),
         metric_image_file_size_issues(pages),
     )
+
+    # Calculate GEO scores for each page
+    geo_scores = await asyncio.gather(
+        *[_calculate_geo_score_for_page(p, {}) for p in pages]
+    )
+
+    # Aggregate GEO scores
+    avg_geo_score = round(
+        sum(g["geo_score"] for g in geo_scores) / len(geo_scores), 1
+    ) if geo_scores else 0
 
     return {
         "pages_crawled": len(pages),
@@ -656,4 +903,9 @@ async def run_full_audit(start_url: str) -> dict:
         "xml_sitemap_issues": async_results[1],
         "schema_markup_errors": metric_schema_markup_errors(pages),
         "image_file_size_issues": async_results[2],
+        # GEO Score (Phase 2.1)
+        "geo_score": {
+            "average": avg_geo_score,
+            "per_page": geo_scores[:100],  # Limit to first 100 for response size
+        },
     }
