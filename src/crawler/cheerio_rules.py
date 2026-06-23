@@ -101,7 +101,7 @@ async def _fetch_sitemap_urls(start_url: str) -> set[str]:
     urls = set()
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(sitemap_url, headers=HEADERS)
+            resp = await client.get(sitemap_url, headers=HEADERS, follow_redirects=True)
             if resp.status_code == 200:
                 # Parse sitemap XML
                 try:
@@ -1218,8 +1218,6 @@ async def run_full_audit(start_url: str) -> dict:
     except Exception as e:
         logger.error(f"GEO score aggregation failed: {e}")
         avg_geo_score = 0
-
-    logger.info(f"GEO SCORING COMPLETE: {scored_count} OK, {failed_count} failed, {timeout_count} timeout out of {len(pages)} total")
 
     return {
         "pages_crawled": len(pages),
