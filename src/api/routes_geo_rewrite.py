@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class GeoRewriteRequest(BaseModel):
     url: str
-    current_content: str
+    current_content: str = ""  # optional — backend fetches if empty
     geo_issues: list[str] = []
 
 
@@ -193,15 +193,36 @@ async def rewrite_for_geo(req: GeoRewriteRequest):
     # Validate input
     if not req.url:
         raise HTTPException(status_code=400, detail="URL is required")
-    if not req.current_content or len(req.current_content.strip()) < 50:
-        raise HTTPException(status_code=400, detail="Content is required (minimum 50 characters)")
+
+    # Fetch page content server-side if not provided (avoids browser CORS)
+    current_content = req.current_content.strip() if req.current_content else ""
+    if len(current_content) < 50:
+        logger.info(f"Fetching page content server-side for {req.url}")
+        try:
+            import re
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                page_resp = await client.get(
+                    req.url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; SEOBot/1.0)"},
+                )
+                page_html = page_resp.text
+            # Strip HTML tags to get plain text
+            text = re.sub(r"<[^>]+>", " ", page_html)
+            text = re.sub(r"\s+", " ", text).strip()
+            current_content = text[:3000]
+            if len(current_content) < 50:
+                raise HTTPException(status_code=400, detail="Page has insufficient text content")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not fetch page content: {exc}")
 
     logger.info(f"GEO rewrite request for {req.url}")
 
     try:
         rewritten_content, diff_summary, faq_suggestions = await call_gemini_rewrite(
             url=req.url,
-            current_content=req.current_content,
+            current_content=current_content,
             geo_issues=req.geo_issues,
         )
     except RuntimeError as exc:

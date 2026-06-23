@@ -28,6 +28,7 @@ def _sanitize_recommendation_text(html_text: str) -> str:
     return text.strip()
 
 METRIC_LABELS = {
+    # Original 13
     "http_errors":                      "4xx / 5xx Errors",
     "missing_h1":                       "Missing H1 Tags",
     "missing_meta_title":               "Missing Meta Titles",
@@ -41,6 +42,7 @@ METRIC_LABELS = {
     "mobile_viewport":                  "Missing Viewport Tag",
     "https_check":                      "Non-HTTPS Pages",
     "redirect_chains":                  "Redirect Chains",
+    # Batch 2 (10 metrics)
     "multiple_h1_tags":                 "Multiple H1 Tags",
     "title_length_issues":              "Title Length Issues",
     "meta_description_length_issues":   "Meta Description Length Issues",
@@ -51,6 +53,19 @@ METRIC_LABELS = {
     "xml_sitemap_issues":               "XML Sitemap Issues",
     "schema_markup_errors":             "Schema Markup Errors",
     "image_file_size_issues":           "Large Uncompressed Images",
+    # Phase 2.1 (12 metrics)
+    "noindex_pages":                    "Noindex Pages",
+    "faq_schema":                       "Missing FAQ Schema",
+    "open_graph_tags":                  "Missing Open Graph Tags",
+    "twitter_card_tags":                "Missing Twitter Card Tags",
+    "image_dimensions":                 "Images Missing Width/Height",
+    "heading_hierarchy":                "Broken Heading Hierarchy",
+    "image_file_names":                 "Non-Descriptive Image Names",
+    "redirect_status_codes":            "Non-Standard Redirect Codes",
+    "content_to_code_ratio":            "Low Content-to-Code Ratio",
+    "word_count":                       "Low Word Count Pages",
+    "url_length":                       "Overly Long URLs",
+    "breadcrumb_schema":                "Missing Breadcrumb Schema",
 }
 
 

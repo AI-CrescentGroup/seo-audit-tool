@@ -92,34 +92,57 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> dict:
 # ── sitemap crawler ──────────────────────────────────────────────────────────
 
 async def _fetch_sitemap_urls(start_url: str) -> set[str]:
-    """Fetch all URLs from sitemap.xml."""
+    """Fetch all URLs from sitemap.xml, handling sitemap index files."""
+    from xml.etree import ElementTree as ET
+
     parsed = urlparse(start_url)
     domain = parsed.netloc.lstrip("www.")
     base = f"{parsed.scheme}://{parsed.netloc}"
     sitemap_url = f"{base}/sitemap.xml"
+    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
-    urls = set()
+    def _extract_page_urls(root_elem) -> set[str]:
+        found = set()
+        for elem in root_elem.findall(".//sm:loc", ns):
+            url = elem.text
+            if url and _same_domain(url, domain) and _is_html_url(url):
+                found.add(_norm(url))
+        return found
+
+    urls: set[str] = set()
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(sitemap_url, headers=HEADERS, follow_redirects=True)
-            if resp.status_code == 200:
-                # Parse sitemap XML
-                try:
-                    from xml.etree import ElementTree as ET
-                    root = ET.fromstring(resp.content)
-                    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-
-                    # Extract <loc> tags from sitemap
-                    for elem in root.findall(".//sm:loc", ns):
-                        url = elem.text
-                        if url and _same_domain(url, domain) and _is_html_url(url):
-                            urls.add(_norm(url))
-
-                    logger.info(f"Sitemap: found {len(urls)} URLs from {sitemap_url}")
-                except Exception as e:
-                    logger.warning(f"Failed to parse sitemap: {e}")
-            else:
+            if resp.status_code != 200:
                 logger.debug(f"Sitemap not found at {sitemap_url} (status {resp.status_code})")
+                return urls
+
+            try:
+                root = ET.fromstring(resp.content)
+            except Exception as e:
+                logger.warning(f"Failed to parse sitemap XML: {e}")
+                return urls
+
+            # Detect sitemap index vs regular sitemap
+            tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+            if tag == "sitemapindex":
+                child_sitemap_locs = [elem.text for elem in root.findall(".//sm:loc", ns) if elem.text]
+                logger.info(f"Sitemap index found: {len(child_sitemap_locs)} child sitemaps")
+                for child_loc in child_sitemap_locs[:30]:
+                    try:
+                        child_resp = await client.get(child_loc, headers=HEADERS, follow_redirects=True)
+                        if child_resp.status_code == 200:
+                            child_root = ET.fromstring(child_resp.content)
+                            page_urls = _extract_page_urls(child_root)
+                            urls.update(page_urls)
+                            logger.debug(f"  {child_loc}: {len(page_urls)} URLs")
+                    except Exception as e:
+                        logger.debug(f"Child sitemap fetch failed {child_loc}: {e}")
+                logger.info(f"Sitemap index: found {len(urls)} total URLs")
+            else:
+                urls = _extract_page_urls(root)
+                logger.info(f"Sitemap: found {len(urls)} URLs from {sitemap_url}")
+
     except Exception as e:
         logger.debug(f"Sitemap fetch failed: {e}")
 

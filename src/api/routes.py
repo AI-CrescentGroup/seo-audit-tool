@@ -65,7 +65,7 @@ async def _run_pagespeed(url: str) -> dict | None:
 
         logger.info(f"PageSpeed API: calling {api_url} with strategy={strategy} for {url}")
 
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=45) as client:
             resp = await client.get(api_url, params=params)
             resp.raise_for_status()
             response_json = resp.json()
