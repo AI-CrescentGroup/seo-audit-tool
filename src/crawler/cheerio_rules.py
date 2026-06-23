@@ -699,6 +699,194 @@ async def metric_image_file_size_issues(pages: list[dict]) -> dict:
     }
 
 
+# ── Phase 2.1 metrics ────────────────────────────────────────────────────────────
+
+def metric_noindex_pages(pages: list[dict]) -> dict:
+    """Pages with <meta name="robots" content="noindex">."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        robots = soup.find("meta", {"name": re.compile(r"robots", re.I)})
+        if robots and "noindex" in (robots.get("content") or "").lower():
+            affected.append(p["url"])
+    severity = "high" if affected else "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_faq_schema(pages: list[dict]) -> dict:
+    """Pages missing FAQPage JSON-LD schema."""
+    with_faq = set()
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            try:
+                data = json.loads(script.string or "{}")
+                if data.get("@type") == "FAQPage" or "FAQPage" in str(data):
+                    with_faq.add(p["url"])
+                    break
+            except Exception:
+                pass
+    missing = [p["url"] for p in pages if p["html"] and p["url"] not in with_faq]
+    severity = "medium" if len(missing) > len(pages) * 0.5 else "low"
+    return _metric(len(missing), missing, severity)
+
+
+def metric_open_graph_tags(pages: list[dict]) -> dict:
+    """Pages missing required Open Graph tags (og:title, og:description, og:image)."""
+    required = {"og:title", "og:description", "og:image"}
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        found = {
+            meta.get("property", "")
+            for meta in soup.find_all("meta", {"property": True})
+            if meta.get("property", "").startswith("og:")
+        }
+        if required - found:
+            affected.append(p["url"])
+    severity = "medium" if len(affected) > len(pages) * 0.3 else "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_twitter_card_tags(pages: list[dict]) -> dict:
+    """Pages missing twitter:card meta tag."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        if not soup.find("meta", {"name": "twitter:card"}):
+            affected.append(p["url"])
+    severity = "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_image_dimensions(pages: list[dict]) -> dict:
+    """Pages with <img> tags missing width/height (causes layout shift / CLS)."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        for img in soup.find_all("img"):
+            if not (img.get("width") and img.get("height")):
+                affected.append(p["url"])
+                break
+    severity = "medium" if len(affected) > len(pages) * 0.3 else "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_heading_hierarchy(pages: list[dict]) -> dict:
+    """Pages with broken heading hierarchy (e.g. H3 before H2, or no H1)."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        headings = [int(tag.name[1]) for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])]
+        if not headings or 1 not in headings:
+            affected.append(p["url"])
+            continue
+        for i in range(len(headings) - 1):
+            if headings[i + 1] > headings[i] + 1:
+                affected.append(p["url"])
+                break
+    severity = "medium" if len(affected) > len(pages) * 0.3 else "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_image_file_names(pages: list[dict]) -> dict:
+    """Pages with images using generic filenames (img001.jpg, photo.png, etc.)."""
+    generic_re = re.compile(r"/(img[-_]?\d+|photo|image[-_]?\d*|pic[-_]?\d*|screenshot|untitled|dsc\d+)", re.I)
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        for img in soup.find_all("img"):
+            src = img.get("src", "")
+            if generic_re.search(src):
+                affected.append(p["url"])
+                break
+    severity = "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_redirect_status_codes(pages: list[dict]) -> dict:
+    """Pages whose redirect chain contains temporary (302/307) instead of permanent (301) redirects."""
+    affected = []
+    for p in pages:
+        chain = p.get("redirect_chain", [])
+        if chain and p.get("status") in (302, 307):
+            affected.append(p["url"])
+    severity = "medium" if affected else "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_content_to_code_ratio(pages: list[dict]) -> dict:
+    """Pages where text content is <10% of total HTML size (too much code, too little content)."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        body_text = soup.get_text(separator=" ", strip=True)
+        ratio = len(body_text) / len(p["html"]) if p["html"] else 0
+        if ratio < 0.10:
+            affected.append(p["url"])
+    severity = "medium" if len(affected) > len(pages) * 0.3 else "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_word_count(pages: list[dict]) -> dict:
+    """Pages with fewer than 300 words (thin content)."""
+    affected = []
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        for tag in soup(["script", "style", "nav", "footer"]):
+            tag.decompose()
+        words = soup.get_text(separator=" ", strip=True).split()
+        if len(words) < 300:
+            affected.append(p["url"])
+    severity = "medium" if len(affected) > len(pages) * 0.3 else "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_url_length(pages: list[dict]) -> dict:
+    """Pages with URLs longer than 75 characters."""
+    affected = [p["url"] for p in pages if len(p["url"]) > 75]
+    severity = "low"
+    return _metric(len(affected), affected, severity)
+
+
+def metric_breadcrumb_schema(pages: list[dict]) -> dict:
+    """Pages missing BreadcrumbList JSON-LD schema."""
+    with_breadcrumb = set()
+    for p in pages:
+        if not p["html"]:
+            continue
+        soup = BeautifulSoup(p["html"], "html.parser")
+        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            try:
+                data = json.loads(script.string or "{}")
+                if data.get("@type") == "BreadcrumbList" or "BreadcrumbList" in str(data):
+                    with_breadcrumb.add(p["url"])
+                    break
+            except Exception:
+                pass
+    missing = [p["url"] for p in pages if p["html"] and p["url"] not in with_breadcrumb]
+    severity = "low"
+    return _metric(len(missing), missing, severity)
+
+
 # ── GEO (Generative Engine Optimization) scoring ────────────────────────────────
 
 def _calculate_readability_score(text: str) -> int:
@@ -840,7 +1028,7 @@ def _score_answer_density(text: str, first_n_words: int = 100) -> int:
     return min(5, int(score))
 
 
-async def _calculate_geo_score_for_page(
+def _calculate_geo_score_for_page(
     page: dict, response_headers: dict = None
 ) -> dict:
     """Calculate GEO score (0–10) and signals for a single page."""
@@ -983,88 +1171,40 @@ async def run_full_audit(start_url: str) -> dict:
         metric_image_file_size_issues(pages),
     )
 
-    # Calculate GEO scores for each page with per-page timeout and error handling
-    logger.info(f"Starting GEO scoring for {len(pages)} pages")
-    logger.info(f"Total pages crawled: {len(pages)}, pages to score: {len(pages)}")
+    # Calculate GEO scores — runs in a thread pool since BeautifulSoup parsing is CPU-bound
+    # and never yields to the event loop (asyncio.gather alone would be sequential here).
+    logger.info(f"Starting GEO scoring for {len(pages)} pages (threaded)")
 
     geo_scores = []
     scored_count = 0
     failed_count = 0
-    timeout_count = 0
 
-    async def score_page_with_timeout(page, timeout_sec=10):
-        """Score a single page with timeout."""
+    async def score_page_in_thread(page):
         page_url = page.get("url", "unknown")
         try:
             result = await asyncio.wait_for(
-                _calculate_geo_score_for_page(page, {}),
-                timeout=timeout_sec
+                asyncio.to_thread(_calculate_geo_score_for_page, page, {}),
+                timeout=15,
             )
-            logger.debug(f"GEO scored page {page_url}: {result.get('geo_score', 0)}/10")
             return result
         except asyncio.TimeoutError:
-            logger.warning(f"GEO timeout for {page_url} (>{timeout_sec}s)")
-            return {
-                "url": page_url,
-                "geo_score": 0,
-                "geo_signals": {},
-                "geo_issues": [f"GEO scoring timeout (>{timeout_sec}s)"],
-            }
+            logger.warning(f"GEO timeout for {page_url}")
+            return {"url": page_url, "geo_score": 0, "geo_signals": {}, "geo_issues": ["GEO scoring timeout"]}
         except Exception as e:
-            logger.error(f"GEO exception for {page_url}: {e}")
-            return {
-                "url": page_url,
-                "geo_score": 0,
-                "geo_signals": {},
-                "geo_issues": [f"GEO error: {str(e)[:100]}"],
-            }
+            logger.error(f"GEO error for {page_url}: {e}")
+            return {"url": page_url, "geo_score": 0, "geo_signals": {}, "geo_issues": [f"GEO error: {str(e)[:80]}"]}
 
     try:
-        logger.info("Submitting all pages for GEO scoring (with 10s per-page timeout)...")
-
-        # Run with per-page timeouts instead of batch timeout
-        geo_results = await asyncio.gather(
-            *[score_page_with_timeout(p, timeout_sec=10) for p in pages],
-            return_exceptions=False,  # Handle exceptions inside score_page_with_timeout
-        )
-
-        for idx, result in enumerate(geo_results):
-            page_url = pages[idx].get("url", "unknown") if idx < len(pages) else f"page_{idx}"
-
-            if isinstance(result, Exception):
-                logger.error(f"GEO result for {page_url} is exception: {result}")
-                failed_count += 1
-                geo_scores.append({
-                    "url": page_url,
-                    "geo_score": 0,
-                    "geo_signals": {},
-                    "geo_issues": [f"Unexpected error: {str(result)[:100]}"],
-                })
-            elif isinstance(result, dict) and "geo_score" in result:
-                geo_scores.append(result)
-                if result.get("geo_issues") and "timeout" in str(result.get("geo_issues")):
-                    timeout_count += 1
-                    logger.warning(f"Page {idx+1}/{len(pages)}: {page_url} TIMEOUT")
-                elif result.get("geo_issues") and "error" in str(result.get("geo_issues")).lower():
-                    failed_count += 1
-                    logger.warning(f"Page {idx+1}/{len(pages)}: {page_url} FAILED")
-                else:
-                    scored_count += 1
-                    logger.info(f"Page {idx+1}/{len(pages)}: {page_url} OK (score: {result.get('geo_score', 0)}/10)")
+        geo_results = await asyncio.gather(*[score_page_in_thread(p) for p in pages])
+        for result in geo_results:
+            geo_scores.append(result)
+            if result.get("geo_score", 0) > 0:
+                scored_count += 1
             else:
-                logger.error(f"Unexpected result type for {page_url}: {type(result)}")
                 failed_count += 1
-                geo_scores.append({
-                    "url": page_url,
-                    "geo_score": 0,
-                    "geo_signals": {},
-                    "geo_issues": ["Unexpected result format"],
-                })
-
-        logger.info(f"GEO scoring batch complete")
+        logger.info(f"GEO scoring complete: {scored_count} scored, {failed_count} failed/timeout out of {len(pages)}")
     except Exception as e:
-        logger.exception(f"CRITICAL: GEO scoring batch processing failed: {e}")
-        logger.error(f"Error details: {type(e).__name__}: {e}")
+        logger.exception(f"GEO scoring batch failed: {e}")
         geo_scores = []
         failed_count = len(pages)
 
@@ -1097,7 +1237,7 @@ async def run_full_audit(start_url: str) -> dict:
         "mobile_viewport": metric_mobile_viewport(pages),
         "https_check": metric_https(pages),
         "redirect_chains": metric_redirect_chains(pages),
-        # New 10 metrics
+        # Batch 2 (10 metrics)
         "multiple_h1_tags": metric_multiple_h1_tags(pages),
         "title_length_issues": metric_title_length_issues(pages),
         "meta_description_length_issues": metric_meta_description_length_issues(pages),
@@ -1108,9 +1248,22 @@ async def run_full_audit(start_url: str) -> dict:
         "xml_sitemap_issues": async_results[1],
         "schema_markup_errors": metric_schema_markup_errors(pages),
         "image_file_size_issues": async_results[2],
+        # Phase 2.1: 12 new metrics
+        "noindex_pages": metric_noindex_pages(pages),
+        "faq_schema": metric_faq_schema(pages),
+        "open_graph_tags": metric_open_graph_tags(pages),
+        "twitter_card_tags": metric_twitter_card_tags(pages),
+        "image_dimensions": metric_image_dimensions(pages),
+        "heading_hierarchy": metric_heading_hierarchy(pages),
+        "image_file_names": metric_image_file_names(pages),
+        "redirect_status_codes": metric_redirect_status_codes(pages),
+        "content_to_code_ratio": metric_content_to_code_ratio(pages),
+        "word_count": metric_word_count(pages),
+        "url_length": metric_url_length(pages),
+        "breadcrumb_schema": metric_breadcrumb_schema(pages),
         # GEO Score (Phase 2.1)
         "geo_score": {
             "average": avg_geo_score,
-            "per_page": geo_scores[:100],  # Limit to first 100 for response size
+            "per_page": geo_scores[:100],
         },
     }
