@@ -13,7 +13,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
-router = APIRouter(tags=["gsc"])
+router = APIRouter(prefix="/api/gsc", tags=["gsc"])
 
 # Import after logging setup
 try:
@@ -94,7 +94,7 @@ def _get_credentials():
 
 # ── endpoints ──────────────────────────────────────────────────────────────
 
-@router.get("/gsc/auth")
+@router.get("/auth")
 async def gsc_auth():
     """Generate Google OAuth URL and initiate auth flow."""
     if not GOOGLE_IMPORTS_OK:
@@ -114,7 +114,7 @@ async def gsc_auth():
         raise HTTPException(status_code=500, detail=f"Auth failed: {str(e)[:100]}")
 
 
-@router.get("/gsc/callback")
+@router.get("/callback")
 async def gsc_callback(code: str, state: Optional[str] = None):
     """Handle OAuth callback from Google, store tokens."""
     if not GOOGLE_IMPORTS_OK:
@@ -144,7 +144,7 @@ async def gsc_callback(code: str, state: Optional[str] = None):
         raise HTTPException(status_code=500, detail=f"Callback failed: {str(e)[:100]}")
 
 
-@router.get("/gsc/status")
+@router.get("/status")
 async def gsc_status():
     """Check if GSC is connected."""
     db = _get_db()
@@ -162,7 +162,7 @@ async def gsc_status():
         raise HTTPException(status_code=500, detail="Status check failed")
 
 
-@router.get("/gsc/data/{domain}")
+@router.get("/data/{domain}")
 async def get_gsc_data(domain: str):
     """Fetch GSC data (site totals + per-URL) for last 30 days."""
     credentials = _get_credentials()
@@ -234,7 +234,7 @@ async def get_gsc_data(domain: str):
         raise HTTPException(status_code=500, detail=f"GSC fetch failed: {str(e)[:100]}")
 
 
-@router.post("/gsc/attach/{audit_id}")
+@router.post("/attach/{audit_id}")
 async def attach_gsc_to_audit(audit_id: str):
     """Fetch GSC data for audit's domain and store in audit.gsc_metrics."""
     db = _get_db()
