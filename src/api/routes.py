@@ -195,6 +195,18 @@ async def _run_audit_background(audit_id: str, start_url: str, clean_domain: str
         except Exception as exc:
             logger.error("PDF generation failed for %s: %s", audit_id, exc, exc_info=True)
 
+        # 6. GSC data (non-blocking)
+        try:
+            from src.api.routes_gsc import attach_gsc_to_audit
+            result = await attach_gsc_to_audit(audit_id)
+            if result.get("success"):
+                if result.get("urls_tracked"):
+                    logger.info(f"GSC data attached to audit {audit_id}: {result['urls_tracked']} URLs")
+                elif result.get("skipped"):
+                    logger.info(f"GSC attach skipped: {result.get('reason')}")
+        except Exception as exc:
+            logger.warning(f"GSC attach failed (non-blocking) for {audit_id}: {exc}")
+
         logger.info("Background audit complete for %s", clean_domain)
 
     except Exception as exc:

@@ -14,3 +14,4 @@ build/
 .coverage
 htmlcov/
 *.log
+client_secret_*.json

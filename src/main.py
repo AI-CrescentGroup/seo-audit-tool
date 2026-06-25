@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 
 from src.api.routes import router
 from src.api.routes_geo_rewrite import router as router_geo_rewrite
+from src.api.routes_gsc import router as router_gsc
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,6 +112,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 app.include_router(router, prefix="/api")
 app.include_router(router_geo_rewrite)
+app.include_router(router_gsc)
 
 
 @app.get("/health")
@@ -121,5 +123,6 @@ async def health():
             "supabase": bool(os.getenv("SUPABASE_URL")),
             "openrouter": bool(os.getenv("OPENROUTER_API_KEY")),
             "pagespeed": bool(os.getenv("PAGESPEED_API_KEY")),
+            "gsc": bool(os.getenv("GOOGLE_CLIENT_ID")),
         },
     }
