@@ -15,6 +15,10 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/gsc", tags=["gsc"])
 
+# Temporary cache for PKCE code verifiers (state -> {verifier, timestamp})
+# In production, use Redis or database instead
+_code_verifier_cache: dict = {}
+
 # Import after logging setup
 try:
     from google_auth_oauthlib.flow import Flow
@@ -107,6 +111,15 @@ async def gsc_auth():
             include_granted_scopes="true",
             prompt="consent"
         )
+
+        # Store code_verifier for PKCE in callback (temporary cache - 10 min validity)
+        # For production, use Redis or DB. For now, store in memory with expiration.
+        import time
+        _code_verifier_cache[state] = {
+            "verifier": flow.code_verifier,
+            "timestamp": time.time()
+        }
+
         logger.info("GSC auth URL generated")
         return {"auth_url": auth_url}
     except Exception as e:
@@ -121,7 +134,18 @@ async def gsc_callback(code: str, state: Optional[str] = None):
         raise HTTPException(status_code=503, detail="Google API not available")
 
     try:
+        # Retrieve stored code_verifier for PKCE
+        code_verifier = None
+        if state and state in _code_verifier_cache:
+            cached = _code_verifier_cache.pop(state)
+            code_verifier = cached.get("verifier")
+
         flow = _build_flow()
+
+        # Set the code_verifier before fetching token (for PKCE)
+        if code_verifier:
+            flow.code_verifier = code_verifier
+
         flow.fetch_token(code=code)
         credentials = flow.credentials
 
