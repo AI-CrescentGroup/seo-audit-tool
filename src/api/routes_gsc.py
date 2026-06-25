@@ -13,7 +13,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["gsc"])
+router = APIRouter(tags=["gsc"])
 
 # Import after logging setup
 try:
