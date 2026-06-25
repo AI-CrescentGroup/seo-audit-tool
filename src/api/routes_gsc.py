@@ -271,6 +271,10 @@ async def attach_gsc_to_audit(audit_id: str):
 
         domain = audit_result.data[0]["domain"]
 
+        # Normalize domain to www variant (GSC usually registers with www)
+        if not domain.startswith("www."):
+            domain = f"www.{domain}"
+
         # Check if GSC is connected (no error, just return early)
         creds_check = db.table("gsc_connections").select("id").eq("domain", "default").execute()
         if not creds_check.data:
