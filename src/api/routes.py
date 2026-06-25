@@ -141,6 +141,7 @@ class AuditResult(BaseModel):
     metrics: dict = {}
     pagespeed: dict | None = None
     ai_recommendations: dict = {}
+    gsc_metrics: dict | None = None
     pdf_url: str | None = None
 
 
@@ -187,25 +188,30 @@ async def _run_audit_background(audit_id: str, start_url: str, clean_domain: str
         })
         logger.info("Audit %s saved to Supabase", audit_id)
 
-        # 5. PDF (non-blocking)
-        try:
-            pdf_url = await generate_and_store_pdf(clean_domain, audit_id, metrics, ai_recs)
-            if pdf_url:
-                await update_pdf_url(audit_id, pdf_url)
-        except Exception as exc:
-            logger.error("PDF generation failed for %s: %s", audit_id, exc, exc_info=True)
-
-        # 6. GSC data (non-blocking)
+        # 5. GSC data (non-blocking)
+        gsc_metrics = None
         try:
             from src.api.routes_gsc import attach_gsc_to_audit
             result = await attach_gsc_to_audit(audit_id)
             if result.get("success"):
                 if result.get("urls_tracked"):
                     logger.info(f"GSC data attached to audit {audit_id}: {result['urls_tracked']} URLs")
+                    # Fetch the gsc_metrics from database for PDF inclusion
+                    audit_record = await get_audit(audit_id)
+                    if audit_record:
+                        gsc_metrics = audit_record.get("gsc_metrics")
                 elif result.get("skipped"):
                     logger.info(f"GSC attach skipped: {result.get('reason')}")
         except Exception as exc:
             logger.warning(f"GSC attach failed (non-blocking) for {audit_id}: {exc}")
+
+        # 6. PDF (non-blocking, now includes GSC metrics if available)
+        try:
+            pdf_url = await generate_and_store_pdf(clean_domain, audit_id, metrics, ai_recs, gsc_metrics)
+            if pdf_url:
+                await update_pdf_url(audit_id, pdf_url)
+        except Exception as exc:
+            logger.error("PDF generation failed for %s: %s", audit_id, exc, exc_info=True)
 
         logger.info("Background audit complete for %s", clean_domain)
 
@@ -238,6 +244,7 @@ async def create_audit(domain: str, background_tasks: BackgroundTasks):
             metrics=existing.get("metrics", {}),
             pagespeed=existing.get("pagespeed"),
             ai_recommendations=parsed_ai_recs,
+            gsc_metrics=existing.get("gsc_metrics"),
             pdf_url=existing.get("pdf_url"),
         )
 
@@ -285,6 +292,7 @@ async def get_audit_endpoint(audit_id: str):
             metrics={},
             pagespeed=None,
             ai_recommendations={},
+            gsc_metrics=None,
         )
 
     # _error flag means background task crashed
@@ -298,6 +306,7 @@ async def get_audit_endpoint(audit_id: str):
             metrics={},
             pagespeed=None,
             ai_recommendations=parsed_ai_recs,
+            gsc_metrics=None,
         )
 
     parsed_ai_recs = _parse_ai_recommendations(record.get("ai_insights"))
@@ -309,6 +318,7 @@ async def get_audit_endpoint(audit_id: str):
         metrics=metrics,
         pagespeed=record.get("pagespeed"),
         ai_recommendations=parsed_ai_recs,
+        gsc_metrics=record.get("gsc_metrics"),
         pdf_url=record.get("pdf_url"),
     )
 

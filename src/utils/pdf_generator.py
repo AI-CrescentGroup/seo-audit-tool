@@ -93,7 +93,7 @@ def _extract_score(ai_insights: dict | None) -> int:
 
 # ── PDF builder ────────────────────────────────────────────────────────────
 
-def _build_pdf_bytes(domain: str, metrics: dict, ai_insights: dict | None) -> bytes:
+def _build_pdf_bytes(domain: str, metrics: dict, ai_insights: dict | None, gsc_metrics: dict | None = None) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=2 * cm, bottomMargin=2 * cm)
     styles = getSampleStyleSheet()
@@ -120,6 +120,29 @@ def _build_pdf_bytes(domain: str, metrics: dict, ai_insights: dict | None) -> by
         geo_color = _score_color(int(geo_avg * 10))  # Scale 0-10 to 0-100
         geo_style = ParagraphStyle("GEOScore", parent=styles["Heading2"], textColor=geo_color)
         story.append(Paragraph(f"GEO Score (LLM Optimization): {geo_avg}/10", geo_style))
+        story.append(Spacer(1, 0.3 * cm))
+
+    # Google Search Console (if available)
+    if gsc_metrics and isinstance(gsc_metrics, dict) and "site_totals" in gsc_metrics:
+        totals = gsc_metrics.get("site_totals", {})
+        story.append(Paragraph("Google Search Console Performance", styles["Heading2"]))
+        gsc_rows = [
+            ["Metric", "Value"],
+            ["Total Impressions", f"{totals.get('impressions', 0):,}"],
+            ["Total Clicks", f"{totals.get('clicks', 0):,}"],
+            ["Average CTR", f"{totals.get('ctr', 0)}%"],
+            ["Average Position", f"{totals.get('avg_position', 0):.1f}"],
+        ]
+        gsc_table = Table(gsc_rows, colWidths=[7 * cm, 4 * cm])
+        gsc_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e40af")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+            ("PADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(gsc_table)
         story.append(Spacer(1, 0.3 * cm))
 
     # AI summary
@@ -222,14 +245,14 @@ def _save_to_tmp(pdf_bytes: bytes, audit_id: str) -> str:
 
 # ── public entry point ─────────────────────────────────────────────────────
 
-async def generate_and_store_pdf(domain: str, audit_id: str, metrics: dict, ai_insights: dict | None):
+async def generate_and_store_pdf(domain: str, audit_id: str, metrics: dict, ai_insights: dict | None, gsc_metrics: dict | None = None):
     """
     Build PDF in memory, upload to Supabase Storage, return public URL.
     Falls back to /tmp path if Supabase upload fails.
     Returns None if PDF generation fails (audit continues without PDF).
     """
     try:
-        pdf_bytes = _build_pdf_bytes(domain, metrics, ai_insights)
+        pdf_bytes = _build_pdf_bytes(domain, metrics, ai_insights, gsc_metrics)
     except Exception as exc:
         logger.error("PDF generation failed for %s (%s): %s", audit_id, domain, exc, exc_info=True)
         return None
