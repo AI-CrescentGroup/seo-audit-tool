@@ -30,9 +30,24 @@ def _norm(url: str) -> str:
     return p._replace(fragment="", path=path, query=p.query).geturl()
 
 
+def _normalize_domain(domain: str) -> str:
+    """Strip www. and trailing slashes, lowercase."""
+    domain = domain.lower().strip().rstrip("/")
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+def _get_domain_variants(domain: str) -> list[str]:
+    """Return both www and non-www variants for domain lookup."""
+    clean = _normalize_domain(domain)
+    return [clean, f"www.{clean}"]
+
+
 def _same_domain(url: str, domain: str) -> bool:
     host = urlparse(url).netloc
-    return host == domain or host == f"www.{domain}" or f"www.{host}" == domain
+    domain_variants = _get_domain_variants(domain)
+    return any(host == variant for variant in domain_variants)
 
 
 _NON_HTML_EXTS = {
@@ -47,6 +62,15 @@ def _is_html_url(url: str) -> bool:
     path = urlparse(url).path.lower().rstrip("/")
     ext = path.rsplit(".", 1)[-1] if "." in path.split("/")[-1] else ""
     return f".{ext}" not in _NON_HTML_EXTS
+
+
+def _is_js_rendered(html: str) -> bool:
+    """Detect if site appears to be JavaScript-rendered (few links in raw HTML)."""
+    if not html:
+        return False
+    soup = BeautifulSoup(html, "html.parser")
+    links = soup.find_all("a", href=True)
+    return len(links) < 5
 
 
 def _metric(count: int, affected_urls: list, severity: str) -> dict:
@@ -91,14 +115,38 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> dict:
 
 # ── sitemap crawler ──────────────────────────────────────────────────────────
 
+async def _get_sitemap_from_robots(domain: str, client: httpx.AsyncClient) -> str | None:
+    """Check robots.txt for Sitemap: directive."""
+    domain_variants = _get_domain_variants(domain)
+    for variant in domain_variants:
+        try:
+            resp = await client.get(f"https://{variant}/robots.txt", headers=HEADERS, timeout=10)
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    if line.lower().startswith("sitemap:"):
+                        sitemap_url = line.split(":", 1)[1].strip()
+                        logger.info(f"Sitemap from robots.txt: {sitemap_url}")
+                        return sitemap_url
+        except Exception:
+            continue
+    return None
+
+
 async def _fetch_sitemap_urls(start_url: str) -> set[str]:
-    """Fetch all URLs from sitemap.xml, handling sitemap index files."""
+    """Fetch all URLs from sitemap.xml, handling sitemap index files.
+    Tries multiple locations and checks robots.txt."""
     from xml.etree import ElementTree as ET
 
     parsed = urlparse(start_url)
     domain = parsed.netloc.lstrip("www.")
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    sitemap_url = f"{base}/sitemap.xml"
+    domain_variants = _get_domain_variants(domain)
+
+    sitemap_paths = [
+        "/sitemap.xml",
+        "/sitemap_index.xml",
+        "/sitemap/sitemap.xml",
+        "/sitemaps/sitemap.xml",
+    ]
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
     def _extract_page_urls(root_elem) -> set[str]:
@@ -109,42 +157,61 @@ async def _fetch_sitemap_urls(start_url: str) -> set[str]:
                 found.add(_norm(url))
         return found
 
-    urls: set[str] = set()
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(sitemap_url, headers=HEADERS, follow_redirects=True)
+    async def _try_fetch_sitemap(client: httpx.AsyncClient, sitemap_url: str) -> set[str]:
+        """Attempt to fetch and parse a single sitemap URL."""
+        try:
+            resp = await client.get(sitemap_url, headers=HEADERS, follow_redirects=True, timeout=10)
             if resp.status_code != 200:
-                logger.debug(f"Sitemap not found at {sitemap_url} (status {resp.status_code})")
-                return urls
+                return set()
 
-            try:
-                root = ET.fromstring(resp.content)
-            except Exception as e:
-                logger.warning(f"Failed to parse sitemap XML: {e}")
-                return urls
-
-            # Detect sitemap index vs regular sitemap
+            root = ET.fromstring(resp.content)
             tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+
+            urls: set[str] = set()
             if tag == "sitemapindex":
                 child_sitemap_locs = [elem.text for elem in root.findall(".//sm:loc", ns) if elem.text]
-                logger.info(f"Sitemap index found: {len(child_sitemap_locs)} child sitemaps")
+                logger.info(f"Sitemap index found at {sitemap_url}: {len(child_sitemap_locs)} child sitemaps")
                 for child_loc in child_sitemap_locs[:30]:
                     try:
-                        child_resp = await client.get(child_loc, headers=HEADERS, follow_redirects=True)
+                        child_resp = await client.get(child_loc, headers=HEADERS, follow_redirects=True, timeout=10)
                         if child_resp.status_code == 200:
                             child_root = ET.fromstring(child_resp.content)
                             page_urls = _extract_page_urls(child_root)
                             urls.update(page_urls)
-                            logger.debug(f"  {child_loc}: {len(page_urls)} URLs")
-                    except Exception as e:
-                        logger.debug(f"Child sitemap fetch failed {child_loc}: {e}")
+                    except Exception:
+                        continue
                 logger.info(f"Sitemap index: found {len(urls)} total URLs")
             else:
                 urls = _extract_page_urls(root)
-                logger.info(f"Sitemap: found {len(urls)} URLs from {sitemap_url}")
+                logger.info(f"Sitemap found at {sitemap_url}: {len(urls)} URLs")
+
+            return urls
+        except Exception:
+            return set()
+
+    urls: set[str] = set()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Try robots.txt first for sitemap location
+            robots_sitemap = await _get_sitemap_from_robots(domain, client)
+            if robots_sitemap:
+                urls = await _try_fetch_sitemap(client, robots_sitemap)
+                if urls:
+                    return urls
+
+            # Try standard sitemap paths on both www and non-www variants
+            for variant in domain_variants:
+                for path in sitemap_paths:
+                    sitemap_url = f"https://{variant}{path}"
+                    urls = await _try_fetch_sitemap(client, sitemap_url)
+                    if urls:
+                        return urls
+
+            if not urls:
+                logger.info(f"No sitemap found for {domain} at any standard location")
 
     except Exception as e:
-        logger.debug(f"Sitemap fetch failed: {e}")
+        logger.debug(f"Sitemap fetch error: {e}")
 
     return urls
 
@@ -156,17 +223,20 @@ async def crawl_site(start_url: str) -> list[dict]:
     BFS crawl starting from start_url.
     1. Seeds queue from sitemap.xml (catches JS-generated pages BFS would miss)
     2. BFS crawl discovers any additional pages via link extraction
+    3. Tries both www and non-www domain variants
     Uses separate 'queued' set (dedup queue entries) vs results list (track fetched).
     """
     parsed = urlparse(start_url)
     domain = parsed.netloc.lstrip("www.")
+    domain_variants = _get_domain_variants(domain)
+
     # 'queued' tracks URLs already added to queue — prevents duplicate queue entries.
     # Do NOT confuse with fetched. A URL is queued before it's fetched.
     queued: set[str] = set()
     queue: asyncio.Queue = asyncio.Queue()
 
     # Seed from sitemap first — discovers JS-rendered pages BFS can't see
-    logger.info(f"Attempting to load sitemap.xml for {start_url}")
+    logger.info(f"Attempting to load sitemap for {domain} (variants: {domain_variants})")
     sitemap_urls = await _fetch_sitemap_urls(start_url)
     if sitemap_urls:
         logger.info(f"Queuing {len(sitemap_urls)} URLs from sitemap")
@@ -174,17 +244,25 @@ async def crawl_site(start_url: str) -> list[dict]:
             queue.put_nowait(url)
             queued.add(url)
     else:
-        logger.info("No sitemap.xml found, using BFS crawl only")
+        logger.info("No sitemap found, using BFS crawl only")
 
-    # Always include start URL
-    start_norm = _norm(start_url)
-    if start_norm not in queued:
-        queue.put_nowait(start_norm)
-        queued.add(start_norm)
+    # Always include both www and non-www homepage as seeds
+    seed_urls = [_norm(start_url)]
+    # Add alternative variant if not already included
+    alt_variant = f"www.{domain}" if not parsed.netloc.startswith("www.") else domain
+    alt_url = _norm(f"https://{alt_variant}/")
+    if alt_url not in seed_urls:
+        seed_urls.append(alt_url)
+
+    for seed_url in seed_urls:
+        if seed_url not in queued:
+            queue.put_nowait(seed_url)
+            queued.add(seed_url)
 
     results: list[dict] = []
     pages_from_sitemap = 0
     pages_from_bfs = 0
+    is_js_rendered = False
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False) as client:
@@ -215,6 +293,12 @@ async def crawl_site(start_url: str) -> list[dict]:
                     pages_from_bfs += 1
 
                 if page["html"] and page["status"] == 200:
+                    # Detect JS-rendered site on homepage
+                    if not is_js_rendered and len(results) == 1:
+                        if _is_js_rendered(page["html"]):
+                            is_js_rendered = True
+                            logger.warning(f"Site appears to be JavaScript-rendered: crawl may be incomplete without headless browser")
+
                     soup = BeautifulSoup(page["html"], "html.parser")
                     for a in soup.find_all("a", href=True):
                         href = a["href"].strip()
@@ -226,6 +310,8 @@ async def crawl_site(start_url: str) -> list[dict]:
                             queued.add(full)
 
     logger.info(f"Crawled {len(results)} pages for {domain}: {pages_from_sitemap} from sitemap, {pages_from_bfs} from BFS discovery")
+    if is_js_rendered:
+        logger.warning(f"Note: This site appears to use JavaScript rendering. Consider using a headless browser for more complete crawling.")
     return results
 
 
